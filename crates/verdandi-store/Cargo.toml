@@ -1,0 +1,19 @@
+[package]
+name = "verdandi-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+verdandi-core = { path = "../verdandi-core" }
+crc32c = "0.6.8"
+ring = "0.17.14"
+rustix = { version = "1.1.5", features = ["fs", "process", "thread"] }
+thiserror = "2.0.18"
+tokio = { version = "1.53.2", features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tempfile = "3.27.0"
+tokio = { version = "1.53.2", features = ["rt"] }
+verdandi-sim = { path = "../verdandi-sim" }

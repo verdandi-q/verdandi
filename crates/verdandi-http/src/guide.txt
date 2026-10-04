@@ -1,0 +1,118 @@
+VERDANDI GUIDE
+
+Verdandi stores messages and gives them to consumers. This node runs alone.
+Every call is plain HTTP. The examples use curl.
+Four calls do the whole job: PUBLISH, TAKE, EXTEND and ACK.
+In a call, replace RECEIPT with the receipt of your take reply.
+This node is in open mode: it has no login. Use it only on a trusted network.
+In open mode, a web page in your browser can read the streams of this node.
+A request must use an IP address or localhost as the Host.
+
+PUBLISH
+Send a message. The call creates the stream.
+  curl -d '{"order":1234,"total":99.50}' http://{host}/s/orders
+The reply is 201: {"ids":["..."],"copies":1,"next":{"take":"/s/orders?group={group}"}}
+Send a JSON array to publish a batch. A batch is atomic.
+A body that is not JSON is stored as it is.
+A body has at most 16 MiB. A message has at most 1 MiB.
+A stream name has parts of A-Z, a-z, 0-9, _ and -, joined by dots. It has at most 200 bytes.
+A name does not start with _ and does not hold .dead. Its last part is not dead.
+Add ?delay=30 to hold the message for 30 seconds.
+delay: seconds, a duration such as 30s, or an RFC 3339 time.
+Add ?ttl=3600 to never deliver the message after 3600 seconds.
+ttl: seconds, or a duration such as 30s.
+The headers Content-Type, traceparent, tracestate, ce-* and X-Msg-* travel with the message.
+They have at most 8192 bytes in all, names and values together.
+Retry safely with a key. A repeat in 24 hours gives 200 and the first reply.
+  curl -H "Idempotency-Key: order-1234-created" -d '{"order":1234}' http://{host}/s/orders
+
+TAKE
+Take work as a group. The call creates the group.
+  curl "http://{host}/s/orders?group=billing&limit=10&lease=30&wait=20"
+The reply is 200: {"receipt":"r_...","lease_until":"...","messages":[{"id":"...","stream":"orders","at":"...","attempt":1,"headers":{},"value":{}}],"next":{"ack":"DELETE /r/r_...","settle":"POST /r/r_..."}}
+The reply is 204 when no work is ready. The Link header gives the next take.
+limit: most messages, 1 to 10000, default 100.
+max_bytes: most bytes of the messages in the reply, default and most 16777216.
+The reply holds at least one message, so one big message can pass this limit.
+lease: seconds that you hold the messages, 1 to 43200, default 30.
+wait: seconds to wait for work, 0 to 60, default 0.
+A message that you do not settle before the lease ends goes to the group again.
+The first lease end of a message is free. Each later lease end is a failure.
+A value that is not UTF-8 text comes as value_base64, in place of value.
+A pattern takes from many streams. Quote the URL: "http://{host}/s/orders.*?group=billing"
+
+EXTEND
+Set the lease to end in 120 seconds from now. Do this when a step is slow.
+The most is 43200 seconds.
+  curl -d '{"extend":120}' http://{host}/r/RECEIPT
+
+ACK
+Ack every message of the take.
+  curl -X DELETE http://{host}/r/RECEIPT
+
+SETTLE BY ID
+Settle some ids. An id that you do not name stays leased.
+  curl -d '{"ack":["ID1"],"nack":[{"id":"ID2","delay":30,"error":"timeout"}],"dead":[{"id":"ID3","error":"bad"}]}' http://{host}/r/RECEIPT
+ack: done. nack: try again after delay seconds. dead: never try again.
+A failure is a nack, or a lease end that is not free.
+After a failure, the message waits 1 second. The wait doubles at each failure, to at most 300 seconds.
+A nack delay replaces this wait.
+At the fifth failure, the message goes dead.
+Each list holds at most 10000 items.
+extend: 1 to 43200 seconds. delay: 0 to 43200 seconds.
+A dead message goes to the stream orders.dead.billing.
+
+READ
+Read the history of one stream. A read leases nothing and creates no group.
+  curl "http://{host}/s/orders?from=-1h&limit=100"
+from: an RFC 3339 time, -7d, now, or a message id (after that id).
+The reply is {"messages":[...],"next":"..."}. Call next for more.
+Add &follow to stream each new message as one JSON line.
+Use curl -N. Without it, curl holds the output back.
+  curl -N "http://{host}/s/orders?from=now&follow"
+Send Accept: text/event-stream with follow for server-sent events.
+
+GROUPS
+Show the count of work of a group.
+  curl http://{host}/g/billing
+The reply: {"pending":0,"in_flight":0,"dead":0,"oldest_age_s":0.0,"provisional":false}
+Deliver messages again from a time:
+  curl -X PUT -d '{"from":"-7d"}' http://{host}/g/billing
+Deliver the dead messages again:
+  curl -X PUT -d '{"redrive":"dead"}' http://{host}/g/billing
+Forget the group:
+  curl -X DELETE http://{host}/g/billing
+
+BULK
+Publish to many streams in one atomic request.
+  curl -d '[{"stream":"orders","value":{"order":1}},{"stream":"audit","value":{"who":"x"}}]' http://{host}/bulk
+
+DELETE A STREAM
+Name the stream twice. There is no undo. The call also deletes its dead streams.
+  curl -X DELETE "http://{host}/s/orders?confirm=orders"
+The reply: {"deleted":"orders","up_to":"..."}
+GET / lists the stream and its dead streams until compaction removes their data.
+
+STATUS
+  curl http://{host}/
+  curl http://{host}/openapi.json
+  curl http://{host}/livez
+  curl http://{host}/readyz
+GET / gives JSON: node, copies, streams, groups, warnings and links. Read the warnings.
+node gives the disk, the write rate and time_until_full_s. It is null when the rate is 0.
+GET /openapi.json gives the whole API. GET /readyz gives 200 when the node serves requests.
+
+ERRORS
+Every error body from a route is JSON: {"error":"what is wrong","next":"what to do"}. Do what next says.
+200 ok, or the first reply to a repeated Idempotency-Key.
+201 accepted.
+204 no work. The wait ended.
+400 the request is not valid.
+403 open mode refuses this request. Use an IP address as the Host, or a client that is not a browser.
+404 no route has this path, or the group does not exist.
+405 the path does not accept this method.
+408 the request body did not arrive in 60 seconds.
+409 the receipt is stale or does not hold the id, the group changed, or a replay is not yet durable. Read next.
+413 a message is over 1 MiB, a batch is over 32 MiB, the request is over 16 MiB, or dead originals are over 64 MiB. Read next.
+429 the disk is full of unacked work. The body names the groups that hold it.
+503 the node is starting or stopping, or the disk is full. Retry later.
