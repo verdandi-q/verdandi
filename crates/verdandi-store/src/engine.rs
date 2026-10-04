@@ -22,7 +22,7 @@ use crate::index::{self, Index, Location, ReadError, Run};
 use crate::log::{self, Log, SealPoint, Written, fits, seal_at, segment_file_name};
 use crate::records::{self, Control, Damage, Message, Origin, RunEntry};
 use crate::recovery::{Warning, recover};
-use crate::retention::{FileInfo, Holding, RESCAN_MS, carries, select};
+use crate::retention::{FileInfo, Holding, RESCAN_MS, SWEEP_MS, carries, select};
 
 pub const IDLE_SEAL_MS: u64 = 30_000;
 pub const KEY_MS: u64 = 24 * 3600 * 1000;
@@ -535,6 +535,8 @@ pub struct Engine<F: Fs> {
     floor: bool,
     enospc: Option<u64>,
     dropped: Vec<DeadCopy>,
+    burying: VecDeque<(DeadCopy, u64)>,
+    buried: Cached,
     compactor: Option<Compactor>,
     compacting: bool,
     pass_due: bool,
@@ -545,6 +547,7 @@ pub struct Engine<F: Fs> {
     files: BTreeMap<PathBuf, FileInfo>,
     owner: BTreeMap<SegmentId, PathBuf>,
     last_rescan: u64,
+    last_sweep: u64,
     active: Option<SegmentId>,
     last_write: u64,
     last_tick: Option<u64>,
@@ -848,6 +851,8 @@ impl<F: Fs + Clone> Engine<F> {
             floor: false,
             enospc: None,
             dropped: Vec::new(),
+            burying: VecDeque::new(),
+            buried: None,
             compactor: Some(compactor),
             compacting: false,
             pass_due: false,
@@ -858,6 +863,7 @@ impl<F: Fs + Clone> Engine<F> {
             files,
             owner: winners,
             last_rescan: clock.now_ms(),
+            last_sweep: clock.now_ms(),
             active: None,
             last_write: 0,
             last_tick: None,
@@ -970,7 +976,10 @@ impl<F: Fs + Clone> Engine<F> {
         let mut ticker = tokio::time::interval(TICK);
         ticker.set_missed_tick_behavior(MissedTickBehavior::Skip);
         let mut open = true;
-        while !self.stopped && (open || self.flight.is_some() || !self.queue.is_empty()) {
+        while !self.stopped
+            && (open || self.flight.is_some() || !self.queue.is_empty() || !self.burying.is_empty())
+        {
+            self.bury();
             self.flush();
             self.pass();
             tokio::select! {
@@ -1282,12 +1291,6 @@ impl<F: Fs + Clone> Engine<F> {
     }
 
     fn settle(&mut self, receipt: Receipt, by: SettleBy, reply: Reply<()>) {
-        if let SettleBy::Ids(settle) = &by
-            && self.dead_bytes(receipt, settle) > QUEUE_CAP
-        {
-            reply.send(Err(Error::TooLarge)).ok();
-            return;
-        }
         let now = self.clock.now_ms();
         let settled = match &by {
             SettleBy::Ids(settle) => self.core.settle(receipt, settle, now),
@@ -1305,22 +1308,6 @@ impl<F: Fs + Clone> Engine<F> {
                 self.release_ticket(ticket, Ok(()));
             }
         }
-    }
-
-    fn dead_bytes(&self, receipt: Receipt, settle: &Settle) -> usize {
-        let mut runs = BTreeMap::new();
-        let mut errors = 0;
-        for bury in &settle.dead {
-            if let Some(location) = self
-                .core
-                .leased_at(receipt, bury.id)
-                .and_then(|at| self.index.locate(at))
-            {
-                runs.insert(location.start, location.run.len as usize);
-            }
-            errors += bury.error.as_ref().map_or(0, String::len);
-        }
-        runs.values().sum::<usize>() + errors
     }
 
     fn act(&mut self, actions: Vec<Action>, ticket: Option<u64>) {
@@ -1351,12 +1338,31 @@ impl<F: Fs + Clone> Engine<F> {
         dead.sort_by_key(|d| d.address);
         let mut run = None;
         for copy in dead {
-            if ticket.is_none() && budget == 0 {
-                self.core.defer_dead(&copy.group, copy.address);
-            } else {
-                budget -= usize::from(ticket.is_none());
-                self.dead_copy(copy, ticket, &mut run);
+            match ticket {
+                Some(ticket) => {
+                    self.hold_ticket(ticket);
+                    self.burying.push_back((copy, ticket));
+                }
+                None if budget == 0 => self.core.defer_dead(&copy.group, copy.address),
+                None => {
+                    budget -= 1;
+                    self.dead_copy(copy, None, &mut run);
+                }
             }
+        }
+    }
+
+    fn bury(&mut self) {
+        while self.queued() < QUEUE_CAP
+            && let Some((copy, ticket)) = self.burying.pop_front()
+        {
+            let mut run = self.buried.take();
+            self.dead_copy(copy, Some(ticket), &mut run);
+            self.buried = run;
+            self.release_ticket(ticket, Ok(()));
+        }
+        if self.burying.is_empty() {
+            self.buried = None;
         }
     }
 
@@ -1823,6 +1829,8 @@ impl<F: Fs + Clone> Engine<F> {
     fn stop(&mut self) {
         self.stopped = true;
         self.queue.clear();
+        self.burying.clear();
+        self.buried = None;
         self.awaits.clear();
         self.waiters.clear();
         for (_, waiting) in std::mem::take(&mut self.keys_in_flight) {
@@ -1914,9 +1922,19 @@ impl<F: Fs + Clone> Engine<F> {
         if rescan {
             self.last_rescan = now;
         }
-        let inputs = select(&self.files, &self.owner, self.full, rescan, |segment| {
-            (self.run_bytes(segment), self.kept(segment, now))
-        });
+        let sweep = now >= self.last_sweep + SWEEP_MS;
+        if sweep {
+            self.last_sweep = now;
+        }
+        let aged = sweep.then(|| now.saturating_sub(SWEEP_MS));
+        let inputs = select(
+            &self.files,
+            &self.owner,
+            self.full,
+            rescan,
+            aged,
+            |segment| (self.run_bytes(segment), self.kept(segment, now)),
+        );
         let result = if inputs.is_empty() {
             Ok(())
         } else if self
@@ -2213,7 +2231,7 @@ impl<F: Fs + Clone> Engine<F> {
             self.push_damage(damage.into_iter().collect(), None);
         }
         let changed = self.full && self.changes != self.passed;
-        if changed || now >= self.last_rescan + RESCAN_MS {
+        if changed || now >= self.last_rescan + RESCAN_MS || now >= self.last_sweep + SWEEP_MS {
             self.pass_due = true;
         }
         if self.flight.is_none()

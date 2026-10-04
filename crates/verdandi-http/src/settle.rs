@@ -2,7 +2,6 @@ use axum::Json;
 use axum::body::Body;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
@@ -60,7 +59,6 @@ struct DeadRequest {
         (status = 403, description = "A cross-origin or non-local request", body = ErrorBody),
         (status = 408, description = "The body did not arrive in 60 s", body = ErrorBody),
         (status = 409, description = "The receipt is unknown or stale, or an id is not in it", body = ErrorBody),
-        (status = 413, description = "The dead originals are over 64 MiB", body = ErrorBody),
         (status = 429, description = "The disk is full of unacked work", body = ErrorBody),
         (status = 503, description = "The node is starting or stopping", body = ErrorBody),
     )
@@ -125,7 +123,7 @@ pub async fn settle(
             Ok(Json(json!({})).into_response())
         }
         Err(e @ Error::Refused(SettleError::Pressure)) => Err(full(handle, e).await),
-        Err(e) => Err(settle_error(e)),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -148,10 +146,7 @@ pub async fn ack_all(
 ) -> Result<Response, Fail> {
     let handle = ready(&node)?;
     let receipt = receipt(path)?;
-    handle
-        .settle(receipt, SettleBy::All)
-        .await
-        .map_err(settle_error)?;
+    handle.settle(receipt, SettleBy::All).await?;
     tracing::info!(%receipt, kinds = %"ack_all", ids = %"", "settle");
     Ok(Json(json!({})).into_response())
 }
@@ -196,15 +191,4 @@ fn id_of(text: &str) -> Result<MessageId, Fail> {
             "use the ids that the take reply gives",
         )
     })
-}
-
-fn settle_error(error: Error) -> Fail {
-    match error {
-        Error::TooLarge => Fail::new(
-            StatusCode::PAYLOAD_TOO_LARGE,
-            "the originals of the dead ids are over 64 MiB",
-            "settle fewer ids at a time",
-        ),
-        error => error.into(),
-    }
 }

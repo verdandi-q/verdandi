@@ -15,7 +15,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use verdandi_core::Timing;
 use verdandi_core::ids::MessageId;
-use verdandi_http::OPEN_MODE;
+use verdandi_http::{NEXT_STEP, OPEN_MODE};
 use verdandi_store::block::{BLOCK_HEADER_LEN, MAX_BLOCK, SEGMENT_BYTES};
 use verdandi_store::engine::TestClock;
 use verdandi_store::log::Log;
@@ -786,6 +786,29 @@ async fn accept_values_match_without_regard_to_case() {
     assert!(reply.body.starts_with("VERDANDI GUIDE"), "{}", reply.body);
     let json = text(&node, Some("Text/Plain, APPLICATION/JSON")).await;
     assert!(json.content_type.starts_with("application/json"));
+    node.stop().await;
+}
+
+#[tokio::test]
+async fn root_warns_early_when_the_disk_fills_within_24_hours_and_when_under_20_percent_is_free() {
+    let fs = verdandi_sim::fault_fs::FaultFs::new(2, 1 << 40);
+    let clock = TestClock::new(START_MS);
+    let node = kit::start_on(fs.clone(), Path::new("/data"), &clock).await;
+    call(node.post("/s/s", vec![b'v'; 100 << 10])).await;
+    let early = |warnings: &[String], prefix: &str| {
+        warnings
+            .iter()
+            .filter(|w| w.starts_with(prefix) && w.ends_with(NEXT_STEP))
+            .count()
+    };
+    fs.set_capacity(fs.used() * 2);
+    let warnings = strings(&call(node.get("/")).await.body["warnings"]);
+    assert_eq!(warnings[0], OPEN_MODE);
+    assert_eq!(early(&warnings, "disk full in about "), 1, "{warnings:?}");
+    assert_eq!(early(&warnings, "disk space low: "), 0, "{warnings:?}");
+    fs.set_capacity(fs.used() + fs.used() / 9);
+    let warnings = strings(&call(node.get("/")).await.body["warnings"]);
+    assert_eq!(early(&warnings, "disk space low: "), 1, "{warnings:?}");
     node.stop().await;
 }
 

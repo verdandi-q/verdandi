@@ -1653,7 +1653,7 @@ fn an_expiry_whose_dead_copy_cannot_fit_is_acked_once_and_its_drop_is_recorded()
 }
 
 #[test]
-fn a_dead_settle_over_the_queue_cap_is_refused_and_its_ids_stay_leased() {
+fn a_dead_settle_over_the_queue_cap_goes_in_steps_and_replies_after_every_dead_copy_is_durable() {
     let rt = runtime();
     let fs = FaultFs::new(36, 1 << 40);
     let clock = TestClock::new(1_000);
@@ -1665,12 +1665,10 @@ fn a_dead_settle_over_the_queue_cap_is_refused_and_its_ids_stay_leased() {
     }
     let (receipt, handed) = leased(rt.block_on(node.handle.take(take("g", "s", 3))));
     assert_eq!(handed.len(), 3);
-    let refused = rt.block_on(node.handle.settle(receipt, bury(&published)));
-    assert_eq!(refused, Err(Error::TooLarge));
-    rt.block_on(node.handle.settle(receipt, ack(&published)))
-        .expect("the ids are still leased");
+    rt.block_on(node.handle.settle(receipt, bury(&published)))
+        .expect("a dead settle over 64 MiB");
     let (_, dead) = leased(rt.block_on(node.handle.take(take("x", "s.dead.g", 10))));
-    assert!(dead.is_empty());
+    assert_eq!(dead.len(), 3);
     stop(&rt, node).expect("clean stop");
 }
 

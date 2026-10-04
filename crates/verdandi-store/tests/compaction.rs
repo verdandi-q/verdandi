@@ -22,7 +22,7 @@ use verdandi_store::fs::{Fs, FsFile, FsStat};
 use verdandi_store::log::Log;
 use verdandi_store::records::{self, Control, Message};
 use verdandi_store::recovery::recover;
-use verdandi_store::retention::RESCAN_MS;
+use verdandi_store::retention::{RESCAN_MS, SWEEP_MS};
 
 const DATA: &str = "/data";
 
@@ -666,6 +666,29 @@ fn a_compacted_file_whose_control_records_no_longer_apply_goes_at_the_next_resca
     clock.advance(RESCAN_MS);
     compact(&rt, &node, &clock);
     assert!(cmp_files(&fs).is_empty(), "{:?}", files(&fs));
+    stop(&rt, node).expect("clean stop");
+}
+
+#[test]
+fn the_hourly_sweep_compacts_old_removable_data_under_the_half_rule_and_never_writes_a_file_that_drops_nothing()
+ {
+    let rt = runtime();
+    let fs = FaultFs::new(33, 1 << 40);
+    let clock = TestClock::new(1_000_000);
+    let node = boot(&rt, &fs, &clock);
+    publish(&rt, &node, "s", &[b'h'; 4096]);
+    let small = publish(&rt, &node, "s", b"a");
+    let (receipt, _) = take(&rt, &node, "g", "s");
+    ack(&rt, &node, receipt, &[small]);
+    seal(&rt, &node, &clock);
+    clock.advance(RETAIN_MS);
+    compact(&rt, &node, &clock);
+    assert_eq!(values(&blocks(&fs)), [vec![b'h'; 4096]]);
+    let swept = cmp_files(&fs);
+    assert_eq!(swept.len(), 1, "{:?}", files(&fs));
+    clock.advance(SWEEP_MS);
+    compact(&rt, &node, &clock);
+    assert_eq!(cmp_files(&fs), swept);
     stop(&rt, node).expect("clean stop");
 }
 

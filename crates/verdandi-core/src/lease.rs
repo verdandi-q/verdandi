@@ -224,10 +224,6 @@ impl Core {
             .collect()
     }
 
-    pub fn leased_at(&self, receipt: Receipt, id: MessageId) -> Option<Address> {
-        self.leases.get(&receipt)?.ids.get(&id).map(|(at, _)| *at)
-    }
-
     pub fn defer_dead(&mut self, group: &str, address: Address) {
         if let Some(hold) = self
             .mem

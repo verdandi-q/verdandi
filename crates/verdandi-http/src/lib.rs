@@ -29,6 +29,7 @@ use error::ErrorBody;
 pub use error::Fail;
 
 pub const OPEN_MODE: &str = "open mode: no cluster key and no auth, so any client can publish, take and delete, and any web page can read the streams across origins. Use it only on a trusted network.";
+pub const NEXT_STEP: &str = "add disk or nodes, or delete streams or groups";
 
 const ROUTES: &str = "read the guide: GET / with Accept: text/plain. The routes are GET /, GET /openapi.json, GET /livez, GET /readyz, POST /s/{stream}, GET /s/{stream}?group={group}, GET /s/{stream}?from={from}, DELETE /s/{stream}?confirm={stream}, POST /bulk, POST /r/{receipt}, DELETE /r/{receipt}, GET /g/{group}, PUT /g/{group} and DELETE /g/{group}";
 

@@ -8,9 +8,10 @@ use serde::Serialize;
 use utoipa::ToSchema;
 
 use crate::error::{ErrorBody, Fail};
-use crate::{Node, OPEN_MODE, host, ready};
+use crate::{NEXT_STEP, Node, OPEN_MODE, host, ready};
 
 const GUIDE: &str = include_str!("guide.txt");
+const DAY_S: u64 = 24 * 3600;
 
 #[derive(Serialize, ToSchema)]
 pub(crate) struct Status {
@@ -123,14 +124,33 @@ pub async fn root(
             d.id, d.stream, d.group
         )
     }));
+    let time_until_full_s = status
+        .disk
+        .and_then(|d| d.free.checked_div(status.write_bytes_per_s));
+    if let Some(d) = status.disk
+        && d.free * 5 < d.total
+    {
+        warnings.push(format!(
+            "disk space low: {} bytes free, {} percent of the disk; {NEXT_STEP}",
+            d.free,
+            d.free * 100 / d.total
+        ));
+    }
+    if let (Some(d), Some(s)) = (status.disk, time_until_full_s)
+        && s < DAY_S
+    {
+        warnings.push(format!(
+            "disk full in about {:.1} hours at the current write rate, {} bytes free; {NEXT_STEP}",
+            s as f64 / 3600.0,
+            d.free
+        ));
+    }
     let json = Json(Status {
         node: Disk {
             disk_total_bytes: status.disk.map(|d| d.total),
             disk_free_bytes: status.disk.map(|d| d.free),
             write_bytes_per_s: status.write_bytes_per_s,
-            time_until_full_s: status
-                .disk
-                .and_then(|d| d.free.checked_div(status.write_bytes_per_s)),
+            time_until_full_s,
         },
         copies: Copies {
             ack_count: 1,
