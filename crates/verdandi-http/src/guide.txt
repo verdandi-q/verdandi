@@ -113,6 +113,6 @@ Every error body from a route is JSON: {"error":"what is wrong","next":"what to 
 405 the path does not accept this method.
 408 the request body did not arrive in 60 seconds.
 409 the receipt is stale or does not hold the id, the group changed, or a replay is not yet durable. Read next.
-413 a message is over 1 MiB, a batch is over 32 MiB, the request is over 16 MiB, or dead originals are over 64 MiB. Read next.
+413 a message is over 1 MiB, a batch is over 32 MiB, or the request is over 16 MiB. Read next.
 429 the disk is full of unacked work. The body names the groups that hold it.
 503 the node is starting or stopping, or the disk is full. Retry later.

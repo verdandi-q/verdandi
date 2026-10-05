@@ -447,3 +447,89 @@ impl<F: Fs> Pass<F> {
         Ok((file, end, runs))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fs::RealFs;
+    use crate::log::Log;
+    use crate::records::Message;
+    use crate::recovery::recover;
+    use verdandi_core::Timing;
+    use verdandi_core::ids::MessageId;
+
+    #[test]
+    fn a_recheck_input_whose_runs_are_all_kept_at_ask_time_writes_no_file() {
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        let tmp = tempfile::TempDir::new_in(&scratch).expect("temp dir");
+        let dir = tmp.path();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let message = Message {
+            position: 0,
+            id: MessageId::new(1_000, 1, 0).expect("id"),
+            timing: Timing::default(),
+            origin: None,
+            headers: Vec::new(),
+            value: b"acked".to_vec(),
+        };
+        let (body, _) = records::encode(&[("s", std::slice::from_ref(&message))], &[]);
+        let log = Log::start(
+            RealFs,
+            1,
+            recover(&RealFs, dir, |_, _, _| {}).expect("recover"),
+        );
+        rt.block_on(log.append(1_000, body, 0))
+            .expect("reply")
+            .expect("append");
+        rt.block_on(log.close());
+        let mut segments = BTreeSet::new();
+        recover(&RealFs, dir, |_, header, _| {
+            segments.insert(header.segment);
+        })
+        .expect("recover");
+        let files = || {
+            let mut names: Vec<String> = std::fs::read_dir(dir)
+                .expect("list")
+                .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        };
+        let before = files();
+        let [name] = before.as_slice() else {
+            panic!("one segment file: {before:?}");
+        };
+        let mut compactor =
+            Compactor::start(RealFs, dir.to_path_buf(), Arc::default()).expect("compactor");
+        assert!(compactor.send(Job {
+            inputs: vec![Input {
+                path: dir.join(name),
+                segments,
+                pinned: BTreeSet::new(),
+                recheck: true,
+            }],
+        }));
+        loop {
+            match rt.block_on(compactor.reports.recv()) {
+                Some(Report::Ask(scanned, reply)) => {
+                    let keeps = scanned
+                        .into_iter()
+                        .map(|s| Keep {
+                            runs: vec![true; s.runs.len()],
+                            controls: s.controls,
+                        })
+                        .collect();
+                    reply.send(keeps).ok();
+                }
+                Some(Report::Done) => break,
+                Some(Report::Output(output)) => panic!("wrote {}", output.path.display()),
+                _ => panic!("an unexpected report"),
+            }
+        }
+        rt.block_on(compactor.close());
+        assert_eq!(files(), before);
+    }
+}

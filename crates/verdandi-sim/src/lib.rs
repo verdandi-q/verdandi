@@ -1,3 +1,4 @@
+pub mod cluster_sim;
 pub mod compaction_sim;
 #[cfg(test)]
 mod core_sim;

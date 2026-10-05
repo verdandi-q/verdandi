@@ -409,6 +409,10 @@ impl Sim {
             ),
             Reason::Dead => {}
         }
+        assert!(
+            !self.tombstoned(&self.messages[&dead.address]),
+            "dead copy of a deleted message for {key:?}"
+        );
         assert!(!self.pressure, "dead copy under pressure for {key:?}");
         assert!(
             !self.forgetting.contains(&dead.group),
@@ -1177,7 +1181,7 @@ impl Sim {
         for ((group, generation, at), (count, _)) in &self.failures {
             if *count >= MAX_FAILURES
                 && self.generation.get(group) == Some(generation)
-                && self.messages.contains_key(at)
+                && self.messages.get(at).is_some_and(|m| !self.tombstoned(m))
             {
                 assert!(
                     self.acked.contains(&(group.clone(), *generation, *at)),

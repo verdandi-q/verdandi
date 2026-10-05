@@ -1,0 +1,18 @@
+[package]
+name = "verdandi-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+verdandi-core = { path = "../verdandi-core" }
+verdandi-store = { path = "../verdandi-store" }
+object_store = { version = "0.14.2", features = ["aws"] }
+reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+snow = { version = "0.10.0", default-features = false, features = ["ring-accelerated", "use-curve25519", "use-chacha20poly1305", "use-sha2"] }
+zstd = { version = "0.14.0", default-features = false }
+
+[dev-dependencies]
+tokio = { version = "1.53.2", features = ["macros", "rt"] }
+url = "2"

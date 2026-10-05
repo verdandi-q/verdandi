@@ -4,6 +4,7 @@ use std::io;
 use std::ops::Bound;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Waker};
@@ -1027,18 +1028,27 @@ struct Counted {
     fs: FaultFs,
     reads: Arc<AtomicUsize>,
     reader: Arc<Mutex<Option<ThreadId>>>,
+    fail: Arc<AtomicUsize>,
 }
 
 struct CountedFile {
     file: FaultFile,
     reads: Arc<AtomicUsize>,
     reader: Arc<Mutex<Option<ThreadId>>>,
+    fail: Arc<AtomicUsize>,
 }
 
 impl FsFile for CountedFile {
     fn read_at(&self, buf: &mut [u8], offset: u64) -> io::Result<()> {
         self.reads.fetch_add(1, Ordering::SeqCst);
         *self.reader.lock().expect("reader") = Some(thread::current().id());
+        if self
+            .fail
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err(io::Error::other("a read error"));
+        }
         self.file.read_at(buf, offset)
     }
 
@@ -1071,6 +1081,7 @@ impl Fs for Counted {
             file: self.fs.create(path)?,
             reads: Arc::clone(&self.reads),
             reader: Arc::clone(&self.reader),
+            fail: Arc::clone(&self.fail),
         })
     }
 
@@ -1079,6 +1090,7 @@ impl Fs for Counted {
             file: self.fs.open(path)?,
             reads: Arc::clone(&self.reads),
             reader: Arc::clone(&self.reader),
+            fail: Arc::clone(&self.fail),
         })
     }
 
@@ -1183,6 +1195,7 @@ fn a_take_or_a_tick_makes_at_most_16_dead_copies_and_reads_each_run_once() {
         fs: FaultFs::new(25, 1 << 40),
         reads: Arc::default(),
         reader: Arc::default(),
+        fail: Arc::default(),
     };
     let clock = TestClock::new(1_000);
     let node = boot(&rt, &fs, Path::new(DATA), &clock);
@@ -1599,6 +1612,7 @@ fn an_expiry_whose_dead_copy_cannot_fit_is_acked_once_and_its_drop_is_recorded()
         fs: FaultFs::new(35, 1 << 40),
         reads: Arc::default(),
         reader: Arc::default(),
+        fail: Arc::default(),
     };
     let dir = Path::new(DATA);
     let id = MessageId::new(1_000, 1, 0).expect("id");
@@ -1653,22 +1667,86 @@ fn an_expiry_whose_dead_copy_cannot_fit_is_acked_once_and_its_drop_is_recorded()
 }
 
 #[test]
-fn a_dead_settle_over_the_queue_cap_goes_in_steps_and_replies_after_every_dead_copy_is_durable() {
+fn a_dead_settle_over_the_queue_cap_goes_in_steps_reads_each_run_once_and_lets_a_publish_through() {
     let rt = runtime();
-    let fs = FaultFs::new(36, 1 << 40);
+    let fs = Counted {
+        fs: FaultFs::new(36, 1 << 40),
+        reads: Arc::default(),
+        reader: Arc::default(),
+        fail: Arc::default(),
+    };
     let clock = TestClock::new(1_000);
     let node = boot(&rt, &fs, Path::new(DATA), &clock);
-    let big = vec![3u8; 22 << 20];
     let mut published = Vec::new();
-    for _ in 0..3 {
+    for fill in (0..6u8).step_by(2) {
+        let (a, b) = (vec![fill; 15 << 20], vec![fill + 1; 15 << 20]);
+        published.extend(publish(&rt, &node, "s", &[&a, &b]));
+    }
+    let (receipt, handed) = leased(rt.block_on(node.handle.take(take("g", "s", 6))));
+    assert_eq!(handed.len(), 6);
+    let reads = fs.reads.load(Ordering::SeqCst);
+    let mut settle = Box::pin(node.handle.settle(receipt, bury(&published)));
+    let mut poll = || {
+        settle
+            .as_mut()
+            .poll(&mut Context::from_waker(Waker::noop()))
+            .is_pending()
+    };
+    assert!(poll());
+    publish(&rt, &node, "other", &[b"x"]);
+    assert!(poll(), "the publish waited for the whole dead settle");
+    rt.block_on(settle).expect("a dead settle over 64 MiB");
+    assert_eq!(fs.reads.load(Ordering::SeqCst) - reads, 3);
+    let (_, dead) = leased(rt.block_on(node.handle.take(take("x", "s.dead.g", 10))));
+    let copies = rt.block_on(node.handle.read(&dead)).expect("read");
+    let firsts: Vec<(MessageId, u8)> = copies
+        .into_iter()
+        .map(|m| m.expect("a dead copy"))
+        .map(|m| (m.origin.expect("origin").id, m.value[0]))
+        .collect();
+    let expected: Vec<(MessageId, u8)> = published.iter().copied().zip(0..).collect();
+    assert_eq!(firsts, expected);
+    stop(&rt, node).expect("clean stop");
+}
+
+#[test]
+fn an_enospc_on_the_second_block_of_a_dead_settle_leases_its_ids_again_and_keeps_the_first_block() {
+    let rt = runtime();
+    let fs = FaultFs::new(38, 1 << 40);
+    let clock = TestClock::new(1_000);
+    let node = boot(&rt, &fs, Path::new(DATA), &clock);
+    let big = vec![5u8; 17 << 20];
+    let mut published = Vec::new();
+    for _ in 0..2 {
         published.extend(publish(&rt, &node, "s", &[&big]));
     }
-    let (receipt, handed) = leased(rt.block_on(node.handle.take(take("g", "s", 3))));
-    assert_eq!(handed.len(), 3);
+    let (receipt, handed) = leased(rt.block_on(node.handle.take(take("g", "s", 2))));
+    assert_eq!(handed.len(), 2);
+    publish(&rt, &node, "other", &[b"x"]);
+    let held = Held::new(&fs);
+    let mut settle = Box::pin(node.handle.settle(receipt, bury(&published)));
+    assert!(pending(&mut settle));
+    rt.block_on(until_sync_held(&fs));
+    fs.fail_next_write(io::ErrorKind::QuotaExceeded, 0);
+    drop(held);
+    let failed = rt.block_on(settle);
+    assert!(matches!(failed, Err(Error::NoSpace)), "{failed:?}");
+    let (_, first) = leased(rt.block_on(node.handle.take(take("x", "s.dead.g", 10))));
+    let origins = |dead: &[Delivery]| -> Vec<MessageId> {
+        rt.block_on(node.handle.read(dead))
+            .expect("read")
+            .into_iter()
+            .map(|m| m.expect("a dead copy").origin.expect("origin").id)
+            .collect()
+    };
+    assert_eq!(origins(&first), published[..1]);
+    let (_, none) = leased(rt.block_on(node.handle.take(take("g", "s", 2))));
+    assert!(none.is_empty(), "the failed id left its lease");
+    clock.advance(PRESSURE_HOLD_MS);
     rt.block_on(node.handle.settle(receipt, bury(&published)))
-        .expect("a dead settle over 64 MiB");
-    let (_, dead) = leased(rt.block_on(node.handle.take(take("x", "s.dead.g", 10))));
-    assert_eq!(dead.len(), 3);
+        .expect("the same receipt settles the failed id");
+    let (_, all) = leased(rt.block_on(node.handle.take(take("y", "s.dead.g", 10))));
+    assert_eq!(origins(&all), published);
     stop(&rt, node).expect("clean stop");
 }
 
@@ -1679,6 +1757,7 @@ fn a_read_runs_off_the_caller_thread_and_finds_each_message_of_its_runs() {
         fs: FaultFs::new(37, 1 << 40),
         reads: Arc::default(),
         reader: Arc::default(),
+        fail: Arc::default(),
     };
     let clock = TestClock::new(1_000);
     let node = boot(&rt, &fs, Path::new(DATA), &clock);
@@ -2172,4 +2251,320 @@ fn the_write_rate_counts_both_damage_blocks_of_recovery_with_their_headers() {
     let written = FILE_HEADER_LEN + 2 * (BLOCK_HEADER_LEN + body.len());
     assert_eq!(status.write_bytes_per_s, written as u64 * 1000 / 60_000);
     stop(&rt, node).expect("clean stop");
+}
+
+fn singles(rt: &Runtime, node: &Node, count: usize) -> (Receipt, Vec<MessageId>) {
+    let big = vec![7u8; 8 << 20];
+    let published: Vec<MessageId> = (0..count)
+        .flat_map(|_| publish(rt, node, "s", &[&big]))
+        .collect();
+    let (receipt, handed) = leased(rt.block_on(node.handle.take(take("g", "s", count))));
+    assert_eq!(handed.len(), count);
+    (receipt, published)
+}
+
+fn pending<F: Future>(future: &mut Pin<Box<F>>) -> bool {
+    future
+        .as_mut()
+        .poll(&mut Context::from_waker(Waker::noop()))
+        .is_pending()
+}
+
+fn copies_in(fs: &FaultFs, stream: &str) -> Vec<usize> {
+    blocks(&fs.snapshot())
+        .iter()
+        .enumerate()
+        .flat_map(|(n, (_, _, body))| {
+            stored_messages(body)
+                .into_iter()
+                .filter(|(s, _)| s == stream)
+                .map(move |_| n)
+        })
+        .collect()
+}
+
+#[test]
+fn a_delete_or_forget_during_a_dead_settle_in_steps_stops_the_later_dead_copies() {
+    for target in ["s", "g", "s.dead.g"] {
+        let rt = runtime();
+        let fs = FaultFs::new(41, 1 << 40);
+        let clock = TestClock::new(1_000);
+        let node = boot(&rt, &fs, Path::new(DATA), &clock);
+        let (receipt, published) = singles(&rt, &node, 10);
+        let held = Held::new(&fs);
+        let mut settle = Box::pin(node.handle.settle(receipt, bury(&published)));
+        assert!(pending(&mut settle));
+        rt.block_on(node.handle.status()).expect("status");
+        let handle = node.handle.clone();
+        let mut delete = Box::pin(async move {
+            if target == "g" {
+                handle.forget("g".to_owned()).await
+            } else {
+                handle.delete_stream(target.to_owned()).await.map(|_| ())
+            }
+        });
+        assert!(pending(&mut delete));
+        rt.block_on(node.handle.status()).expect("status");
+        drop(held);
+        rt.block_on(delete).expect("delete");
+        rt.block_on(settle).expect("settle");
+        let (_, visible) = leased(rt.block_on(node.handle.take(take("x", "s.dead.g", 20))));
+        stop(&rt, node).expect("clean stop");
+        let written = copies_in(&fs, "s.dead.g").len();
+        if target == "g" {
+            assert!(written < published.len(), "{written} dead copies");
+        } else {
+            assert_eq!(visible.len(), 0, "deleted data came back after {target}");
+        }
+    }
+}
+
+#[test]
+fn an_expiry_dead_copy_during_an_unsynced_delete_is_never_written() {
+    let rt = runtime();
+    let fs = FaultFs::new(45, 1 << 40);
+    let clock = TestClock::new(1_000);
+    let node = boot(&rt, &fs, Path::new(DATA), &clock);
+    rt.block_on(node.handle.publish(vec![expiring("s", b"a", 1_005)], None))
+        .expect("publish");
+    clock.advance(10);
+    let held = Held::new(&fs);
+    let handle = node.handle.clone();
+    let mut delete = Box::pin(async move { handle.delete_stream("s".to_owned()).await });
+    assert!(pending(&mut delete));
+    rt.block_on(node.handle.status()).expect("status");
+    let (_, none) = leased(rt.block_on(node.handle.take(take("g", "s", 1))));
+    assert!(none.is_empty());
+    drop(held);
+    rt.block_on(delete).expect("delete");
+    clock.advance(10);
+    rt.block_on(node.handle.status()).expect("status");
+    stop(&rt, node).expect("clean stop");
+    assert_eq!(copies_in(&fs, "s.dead.g"), Vec::<usize>::new());
+}
+
+#[test]
+fn a_dead_settle_in_steps_stops_under_disk_pressure_and_leases_the_rest_again() {
+    let rt = runtime();
+    let fs = FaultFs::new(42, 1 << 40);
+    let clock = TestClock::new(1_000);
+    let node = boot(&rt, &fs, Path::new(DATA), &clock);
+    let (receipt, published) = singles(&rt, &node, 10);
+    let held = Held::new(&fs);
+    let mut settle = Box::pin(node.handle.settle(receipt, bury(&published)));
+    assert!(pending(&mut settle));
+    rt.block_on(node.handle.status()).expect("status");
+    fs.set_capacity(fs.used() + (200 << 20));
+    clock.advance(1);
+    rt.block_on(node.handle.status()).expect("status");
+    drop(held);
+    assert_eq!(
+        rt.block_on(settle),
+        Err(Error::Refused(SettleError::Pressure))
+    );
+    let (_, none) = leased(rt.block_on(node.handle.take(take("g", "s", 10))));
+    assert!(none.is_empty(), "an abandoned id left its lease");
+    assert!(copies_in(&fs, "s.dead.g").len() < published.len());
+    fs.set_capacity(1 << 40);
+    clock.advance(PRESSURE_HOLD_MS);
+    rt.block_on(node.handle.status()).expect("status");
+    rt.block_on(node.handle.settle(receipt, bury(&published)))
+        .expect("the same receipt settles the rest");
+    let (_, all) = leased(rt.block_on(node.handle.take(take("x", "s.dead.g", 20))));
+    assert_eq!(all.len(), published.len());
+    stop(&rt, node).expect("clean stop");
+}
+
+#[test]
+fn a_dead_settle_in_steps_stops_when_a_step_finds_free_space_under_the_floor_before_a_tick() {
+    let rt = runtime();
+    let fs = FaultFs::new(47, 1 << 40);
+    let clock = TestClock::new(1_000);
+    let node = boot(&rt, &fs, Path::new(DATA), &clock);
+    let (receipt, published) = singles(&rt, &node, 10);
+    let held = Held::new(&fs);
+    let mut settle = Box::pin(node.handle.settle(receipt, bury(&published)));
+    assert!(pending(&mut settle));
+    rt.block_on(node.handle.status()).expect("status");
+    fs.set_capacity(fs.used() + (128 << 20));
+    drop(held);
+    assert_eq!(
+        rt.block_on(settle),
+        Err(Error::Refused(SettleError::Pressure))
+    );
+    stop(&rt, node).expect("clean stop");
+    assert!(copies_in(&fs, "s.dead.g").len() < published.len());
+}
+
+#[test]
+fn a_one_id_dead_settle_takes_its_turn_inside_a_long_dead_settle() {
+    let rt = runtime();
+    let fs = FaultFs::new(43, 1 << 40);
+    let clock = TestClock::new(1_000);
+    let node = boot(&rt, &fs, Path::new(DATA), &clock);
+    let (long, published) = singles(&rt, &node, 10);
+    let small = publish(&rt, &node, "t", &[b"b"]);
+    let (short, _) = leased(rt.block_on(node.handle.take(take("h", "t", 1))));
+    let held = Held::new(&fs);
+    let mut first = Box::pin(node.handle.settle(long, bury(&published)));
+    assert!(pending(&mut first));
+    rt.block_on(node.handle.status()).expect("status");
+    let mut second = Box::pin(node.handle.settle(short, bury(&small)));
+    assert!(pending(&mut second));
+    rt.block_on(node.handle.status()).expect("status");
+    drop(held);
+    rt.block_on(second).expect("the one-id settle");
+    rt.block_on(first).expect("the long settle");
+    stop(&rt, node).expect("clean stop");
+    let ids_in = |stream: &str| -> Vec<MessageId> {
+        blocks(&fs.snapshot())
+            .iter()
+            .flat_map(|(_, _, body)| stored_messages(body))
+            .filter(|(s, _)| s == stream)
+            .map(|(_, m)| m.id)
+            .collect()
+    };
+    let short = ids_in("t.dead.h");
+    let long = ids_in("s.dead.g");
+    assert_eq!(short.len(), 1);
+    assert_eq!(long.len(), published.len());
+    let before = long.iter().filter(|id| **id < short[0]).count();
+    assert!(
+        before <= 8,
+        "the one-id settle waited for {before} long copies"
+    );
+}
+
+#[test]
+fn a_repeat_settle_waiting_on_a_dead_copy_gets_the_read_error_of_that_copy() {
+    let rt = runtime();
+    let fs = Counted {
+        fs: FaultFs::new(44, 1 << 40),
+        reads: Arc::default(),
+        reader: Arc::default(),
+        fail: Arc::default(),
+    };
+    let clock = TestClock::new(1_000);
+    let node = boot(&rt, &fs, Path::new(DATA), &clock);
+    let (receipt, published) = singles(&rt, &node, 10);
+    let held = Held::new(&fs.fs);
+    let mut settle = Box::pin(node.handle.settle(receipt, bury(&published)));
+    assert!(pending(&mut settle));
+    rt.block_on(node.handle.status()).expect("status");
+    let mut repeat = Box::pin(node.handle.settle(receipt, bury(&published[9..])));
+    assert!(pending(&mut repeat));
+    rt.block_on(node.handle.status()).expect("status");
+    fs.fail.store(1_000, Ordering::SeqCst);
+    drop(held);
+    let unreadable = |result: &Result<(), Error>| matches!(result, Err(Error::Unreadable(_)));
+    let repeated = rt
+        .block_on(async { tokio::time::timeout(Duration::from_secs(10), repeat).await })
+        .expect("the repeat settle waited for ever");
+    assert!(unreadable(&repeated), "{repeated:?}");
+    let settled = rt.block_on(settle);
+    assert!(unreadable(&settled), "{settled:?}");
+    stop(&rt, node).expect("clean stop");
+}
+
+#[test]
+fn a_read_error_fails_the_rest_of_its_run_with_one_read_and_a_later_settle_reads_the_run_again() {
+    let rt = runtime();
+    let fs = Counted {
+        fs: FaultFs::new(45, 1 << 40),
+        reads: Arc::default(),
+        reader: Arc::default(),
+        fail: Arc::default(),
+    };
+    let clock = TestClock::new(1_000);
+    let node = boot(&rt, &fs, Path::new(DATA), &clock);
+    let published = publish(&rt, &node, "s", &[b"a", b"b", b"c", b"d"]);
+    let (receipt, handed) = leased(rt.block_on(node.handle.take(take("g", "s", 4))));
+    assert_eq!(handed.len(), 4);
+    fs.fail.store(1_000, Ordering::SeqCst);
+    fs.reads.store(0, Ordering::SeqCst);
+    let settled = rt.block_on(node.handle.settle(receipt, bury(&published[..3])));
+    assert!(matches!(settled, Err(Error::Unreadable(_))), "{settled:?}");
+    assert_eq!(fs.reads.load(Ordering::SeqCst), 1);
+    fs.fail.store(0, Ordering::SeqCst);
+    rt.block_on(node.handle.settle(receipt, bury(&published[3..])))
+        .expect("a later settle reads the run again");
+    let (_, dead) = leased(rt.block_on(node.handle.take(take("x", "s.dead.g", 10))));
+    let origins: Vec<MessageId> = rt
+        .block_on(node.handle.read(&dead))
+        .expect("read")
+        .into_iter()
+        .map(|m| m.expect("a dead copy").origin.expect("origin").id)
+        .collect();
+    assert_eq!(origins, published[3..]);
+    stop(&rt, node).expect("clean stop");
+}
+
+#[test]
+fn a_dead_settle_backlog_over_the_cap_stops_new_commands_until_it_drains() {
+    let rt = runtime();
+    let fs = FaultFs::new(46, 1 << 40);
+    let clock = TestClock::new(1_000);
+    let node = boot(&rt, &fs, Path::new(DATA), &clock);
+    let published = publish(&rt, &node, "s", &[b"a", b"b", b"c", b"d"]);
+    let (receipt, _) = leased(rt.block_on(node.handle.take(take("g", "s", 4))));
+    let held = Held::new(&fs);
+    let fill = vec![1u8; 20 << 20];
+    let mut fills: Vec<_> = (0..3)
+        .map(|_| Box::pin(node.handle.publish(vec![message("fill", &fill)], None)))
+        .collect();
+    for f in &mut fills {
+        assert!(pending(f));
+    }
+    rt.block_on(node.handle.status()).expect("status");
+    let mut settles: Vec<_> = published
+        .iter()
+        .map(|&id| {
+            let by = SettleBy::Ids(Settle {
+                dead: vec![Bury {
+                    id,
+                    error: Some("e".repeat(20 << 20)),
+                }],
+                ..Settle::default()
+            });
+            Box::pin(node.handle.settle(receipt, by))
+        })
+        .collect();
+    for s in &mut settles {
+        assert!(pending(s));
+    }
+    let mut status = Box::pin(node.handle.status());
+    let early =
+        rt.block_on(async { tokio::time::timeout(Duration::from_millis(500), &mut status).await });
+    assert!(
+        early.is_err(),
+        "a command came in over the dead backlog cap"
+    );
+    drop(held);
+    rt.block_on(status).expect("status");
+    for s in settles {
+        rt.block_on(s).expect("settle");
+    }
+    for f in fills {
+        rt.block_on(f).expect("fill");
+    }
+    stop(&rt, node).expect("clean stop");
+}
+
+#[test]
+fn a_close_during_a_dead_settle_in_steps_replies_stopped_and_writes_no_more_copies() {
+    let rt = runtime();
+    let fs = FaultFs::new(47, 1 << 40);
+    let clock = TestClock::new(1_000);
+    let node = boot(&rt, &fs, Path::new(DATA), &clock);
+    let (receipt, published) = singles(&rt, &node, 10);
+    let held = Held::new(&fs);
+    let mut settle = Box::pin(node.handle.settle(receipt, bury(&published)));
+    assert!(pending(&mut settle));
+    rt.block_on(node.handle.status()).expect("status");
+    rt.block_on(node.handle.close()).expect("close");
+    rt.block_on(node.handle.status()).ok();
+    drop(held);
+    assert_eq!(rt.block_on(settle), Err(Error::Stopped));
+    stop(&rt, node).expect("clean stop");
+    assert!(copies_in(&fs, "s.dead.g").len() < published.len());
 }

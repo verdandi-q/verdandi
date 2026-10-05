@@ -24,6 +24,7 @@ pub(crate) struct FileInfo {
     pub(crate) bodies: u64,
     pub(crate) carried: u64,
     pub(crate) first_ms: u64,
+    pub(crate) controls: bool,
     pub(crate) sealed: bool,
     pub(crate) segments: BTreeSet<SegmentId>,
 }
@@ -87,7 +88,11 @@ pub(crate) fn select(
                 pinned,
                 recheck,
             };
-            inputs.push((held > 0 || info.carried > 0, info.first_ms, input));
+            inputs.push((
+                held > 0 || info.carried > 0 || info.controls,
+                info.first_ms,
+                input,
+            ));
         }
     }
     inputs.sort_by_key(|(output, first_ms, _)| (*output, *first_ms));
@@ -100,7 +105,7 @@ mod tests {
 
     #[test]
     fn a_pass_puts_the_inputs_that_need_no_output_first_and_keeps_oldest_first_inside_each_kind() {
-        let file = |name: &str, seq: u32, first_ms: u64| {
+        let file = |name: &str, seq: u32, first_ms: u64, controls: bool| {
             let segment = SegmentId {
                 incarnation: 1,
                 seq,
@@ -110,16 +115,18 @@ mod tests {
                 bodies: 100,
                 carried: 0,
                 first_ms,
+                controls,
                 sealed: true,
                 segments: BTreeSet::from([segment]),
             };
             ((PathBuf::from(name), info), (segment, PathBuf::from(name)))
         };
         let (files, owner): (BTreeMap<_, _>, BTreeMap<_, _>) = [
-            file("held-old", 0, 1),
-            file("plain-old", 1, 2),
-            file("held-new", 2, 3),
-            file("plain-new", 3, 4),
+            file("acks-old", 5, 0, true),
+            file("held-old", 0, 1, false),
+            file("plain-old", 1, 2, false),
+            file("held-new", 2, 3, false),
+            file("plain-new", 3, 4, false),
         ]
         .into_iter()
         .unzip();
@@ -130,6 +137,9 @@ mod tests {
             .iter()
             .map(|i| i.path.to_str().unwrap_or_default())
             .collect();
-        assert_eq!(order, ["plain-old", "plain-new", "held-old", "held-new"]);
+        assert_eq!(
+            order,
+            ["plain-old", "plain-new", "acks-old", "held-old", "held-new"]
+        );
     }
 }

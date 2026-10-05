@@ -8,6 +8,8 @@ mod i09_no_redelivery_after_durable_ack;
 mod i10_core_has_no_io;
 mod i12_replicated_state_merges;
 mod i14_nobody_types_a_node_identity;
+mod i15_holders_change_only_by_repair;
+mod i16_the_floor_falls_only_by_drain_accept_loss_or_the_quiet_rule;
 mod i17_a_copy_counts_only_after_fsync;
 mod i18_a_message_address_never_changes;
 mod i19_compaction_never_deletes_an_input_before_its_output_is_durable;

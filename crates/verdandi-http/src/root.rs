@@ -139,9 +139,20 @@ pub async fn root(
     if let (Some(d), Some(s)) = (status.disk, time_until_full_s)
         && s < DAY_S
     {
+        let when = match s {
+            _ if d.free == 0 => String::new(),
+            0..=60 => " in about 1 minute at the current write rate".to_owned(),
+            61..3600 => format!(
+                " in about {} minutes at the current write rate",
+                s.div_ceil(60)
+            ),
+            _ => format!(
+                " in about {:.1} hours at the current write rate",
+                s as f64 / 3600.0
+            ),
+        };
         warnings.push(format!(
-            "disk full in about {:.1} hours at the current write rate, {} bytes free; {NEXT_STEP}",
-            s as f64 / 3600.0,
+            "disk full{when}, {} bytes free; {NEXT_STEP}",
             d.free
         ));
     }

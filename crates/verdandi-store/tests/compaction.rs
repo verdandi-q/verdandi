@@ -670,8 +670,7 @@ fn a_compacted_file_whose_control_records_no_longer_apply_goes_at_the_next_resca
 }
 
 #[test]
-fn the_hourly_sweep_compacts_old_removable_data_under_the_half_rule_and_never_writes_a_file_that_drops_nothing()
- {
+fn the_hourly_sweep_compacts_old_removable_data_under_the_half_rule() {
     let rt = runtime();
     let fs = FaultFs::new(33, 1 << 40);
     let clock = TestClock::new(1_000_000);
@@ -683,12 +682,27 @@ fn the_hourly_sweep_compacts_old_removable_data_under_the_half_rule_and_never_wr
     seal(&rt, &node, &clock);
     clock.advance(RETAIN_MS);
     compact(&rt, &node, &clock);
-    assert_eq!(values(&blocks(&fs)), [vec![b'h'; 4096]]);
-    let swept = cmp_files(&fs);
-    assert_eq!(swept.len(), 1, "{:?}", files(&fs));
-    clock.advance(SWEEP_MS);
+    let old = files(&fs);
+    clock.advance(SWEEP_MS / 2);
+    publish(&rt, &node, "u", &[b'u'; 4096]);
+    publish(&rt, &node, "t", b"y");
+    delete(&rt, &node, "t");
+    seal(&rt, &node, &clock);
+    let young: Vec<String> = files(&fs)
+        .into_iter()
+        .filter(|n| n.starts_with("seg-") && !old.contains(n))
+        .collect();
+    clock.advance(SWEEP_MS / 2);
     compact(&rt, &node, &clock);
-    assert_eq!(cmp_files(&fs), swept);
+    assert_eq!(cmp_files(&fs).len(), 1, "{:?}", files(&fs));
+    assert!(!young.is_empty());
+    for name in &young {
+        assert!(files(&fs).contains(name), "the sweep rewrote {name}");
+    }
+    assert_eq!(
+        values(&blocks(&fs)),
+        [vec![b'h'; 4096], vec![b'u'; 4096], b"y".to_vec()]
+    );
     stop(&rt, node).expect("clean stop");
 }
 

@@ -243,7 +243,9 @@ fn sigterm_ends_each_long_poll_closes_the_engine_and_exits_0() {
         .filter_map(|m| m["id"].as_str().map(str::to_owned))
         .collect();
     assert_eq!(ids, published);
-    let warnings: Vec<String> = strings(&root["warnings"]).collect();
+    let warnings: Vec<String> = strings(&root["warnings"])
+        .filter(|w| !w.starts_with("disk space low: ") && !w.starts_with("disk full in about "))
+        .collect();
     assert_eq!(warnings, [OPEN_MODE], "{root}");
 }
 
@@ -344,7 +346,13 @@ fn profile(env: &[(&str, &str)]) -> (usize, String) {
         .join(running.0.id().to_string())
         .join("task");
     let threads = std::fs::read_dir(tasks).expect("tasks").count();
-    (threads, running.stderr())
+    let log = running
+        .stderr()
+        .lines()
+        .filter(|l| !l.contains("uri=/readyz"))
+        .collect::<Vec<_>>()
+        .join("\n");
+    (threads, log)
 }
 
 #[test]

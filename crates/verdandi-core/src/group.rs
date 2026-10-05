@@ -640,12 +640,12 @@ impl Core {
                 continue;
             }
             mem.holds
-                .retain(|at, hold| *hold != Hold::DeadDue || self.state.message_at(*at).is_some());
+                .retain(|at, hold| *hold != Hold::DeadDue || self.state.live_at(*at).is_some());
             for (at, hold) in &mut mem.holds {
                 if *hold != Hold::DeadDue {
                     continue;
                 }
-                let Some((id, stream)) = self.state.message_at(*at) else {
+                let Some((id, stream)) = self.state.live_at(*at) else {
                     continue;
                 };
                 let failure = g.failures.get(at);
@@ -996,6 +996,25 @@ mod tests {
         let actions = core.tick(400);
         assert!(matches!(actions.as_slice(), [Action::Dead(d)] if d.reason == Reason::Expired));
         assert_eq!(core.tick(500), []);
+    }
+
+    #[test]
+    fn a_dead_copy_waiting_on_pressure_is_dropped_when_its_stream_is_deleted() {
+        let mut core = Core::new(INC);
+        let timing = Timing {
+            delay_until: None,
+            expire_at: Some(5),
+        };
+        publish_timed(&mut core, "s", addr(1, 0), 1, 1, timing);
+        core.set_pressure(true);
+        assert!(take(&mut core, "g", "s", 1, 1, 10).is_empty());
+        let delete = Record::Tombstone {
+            stream: "s".into(),
+            up_to: id(20, 0),
+        };
+        core.apply(delete, 20);
+        core.set_pressure(false);
+        assert_eq!(core.tick(30), []);
     }
 
     #[test]

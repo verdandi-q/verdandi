@@ -1,3 +1,4 @@
+pub mod cluster;
 pub mod group;
 pub mod ids;
 pub mod lease;
@@ -189,6 +190,11 @@ impl State {
             nth_id(chunk.first_id, at.position - start.position)?,
             &chunk.stream,
         ))
+    }
+
+    fn live_at(&self, at: Address) -> Option<(MessageId, &str)> {
+        self.message_at(at)
+            .filter(|(id, stream)| self.tombstone(stream).is_none_or(|t| *id > t))
     }
 
     fn tombstone(&self, stream: &str) -> Option<MessageId> {

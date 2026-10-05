@@ -535,8 +535,10 @@ pub struct Engine<F: Fs> {
     floor: bool,
     enospc: Option<u64>,
     dropped: Vec<DeadCopy>,
-    burying: VecDeque<(DeadCopy, u64)>,
+    burying: VecDeque<(u64, MessageId, VecDeque<DeadCopy>)>,
+    burying_bytes: usize,
     buried: Cached,
+    deleting: usize,
     compactor: Option<Compactor>,
     compacting: bool,
     pass_due: bool,
@@ -561,6 +563,7 @@ pub struct Engine<F: Fs> {
 struct Fold {
     runs: Vec<(PathBuf, Address, Run, Record, u64)>,
     first: BTreeMap<PathBuf, (u64, u64)>,
+    controls: BTreeSet<PathBuf>,
     max_id: Option<MessageId>,
     keys: BTreeMap<(String, String), Kept>,
     damage: BTreeSet<Damage>,
@@ -590,6 +593,9 @@ impl Fold {
             self.malformed.push(malformed);
             return;
         };
+        if !body.controls.is_empty() {
+            self.controls.insert(path.to_path_buf());
+        }
         let mut runs = Vec::with_capacity(body.runs.len());
         for (entry, bytes) in &body.runs {
             let Ok(messages) = records::decode_run(bytes, entry.count) else {
@@ -813,6 +819,7 @@ impl<F: Fs + Clone> Engine<F> {
                     0
                 },
                 first_ms,
+                controls: fold.controls.contains(path),
                 sealed: !unsealed.iter().any(|p| p.file == *path),
                 segments: held.remove(path.as_path()).unwrap_or_default(),
             };
@@ -852,7 +859,9 @@ impl<F: Fs + Clone> Engine<F> {
             enospc: None,
             dropped: Vec::new(),
             burying: VecDeque::new(),
+            burying_bytes: 0,
             buried: None,
+            deleting: 0,
             compactor: Some(compactor),
             compacting: false,
             pass_due: false,
@@ -965,6 +974,7 @@ impl<F: Fs + Clone> Engine<F> {
                 written.offset + total,
                 body.len() as u64,
                 now,
+                true,
             );
         }
         self.last_write = now;
@@ -983,12 +993,15 @@ impl<F: Fs + Clone> Engine<F> {
             self.flush();
             self.pass();
             tokio::select! {
-                command = self.rx.recv(), if open && self.queued() < QUEUE_CAP => match command {
+                command = self.rx.recv(), if open && self.queued() < QUEUE_CAP && self.burying_bytes < QUEUE_CAP => match command {
                     Some(command) => {
                         self.tick();
                         self.command(command);
                     }
-                    None => open = false,
+                    None => {
+                        open = false;
+                        self.abandon_burying(Error::Stopped);
+                    }
                 },
                 (flight, result) = land(&mut self.flight) => self.landed(flight, result),
                 report = reported(&mut self.compactor) => self.report(report),
@@ -1158,6 +1171,10 @@ impl<F: Fs + Clone> Engine<F> {
         } else {
             (ms, counter + 1)
         };
+        self.issued()
+    }
+
+    fn issued(&self) -> MessageId {
         let (ms, counter) = self.last_id;
         MessageId::new(ms, self.incarnation, counter).expect("the clock is inside 48 bits")
     }
@@ -1336,34 +1353,88 @@ impl<F: Fs + Clone> Engine<F> {
             }
         }
         dead.sort_by_key(|d| d.address);
+        if let Some(ticket) = ticket {
+            if !dead.is_empty() {
+                self.hold_ticket(ticket);
+                self.burying_bytes += dead.iter().map(waiting_len).sum::<usize>();
+                self.burying.push_back((ticket, self.issued(), dead.into()));
+            }
+            return;
+        }
         let mut run = None;
         for copy in dead {
-            match ticket {
-                Some(ticket) => {
-                    self.hold_ticket(ticket);
-                    self.burying.push_back((copy, ticket));
-                }
-                None if budget == 0 => self.core.defer_dead(&copy.group, copy.address),
-                None => {
-                    budget -= 1;
-                    self.dead_copy(copy, None, &mut run);
-                }
+            if budget == 0 || self.deleting > 0 {
+                self.core.defer_dead(&copy.group, copy.address);
+            } else {
+                budget -= 1;
+                self.dead_copy(copy, None, &mut run);
             }
         }
     }
 
     fn bury(&mut self) {
-        while self.queued() < QUEUE_CAP
-            && let Some((copy, ticket)) = self.burying.pop_front()
+        let refill =
+            !self.burying.is_empty() && self.deleting == 0 && self.queued() < QUEUE_CAP / 2;
+        let low = refill
+            && self.fs.statfs(&self.dir).is_ok_and(|stat| {
+                retention::pressure(stat.free.saturating_sub(self.queued() as u64), stat.total)
+            });
+        if self.full || low {
+            self.abandon_burying(Error::Refused(SettleError::Pressure));
+        }
+        while self.deleting == 0
+            && self.queued() < QUEUE_CAP / 2
+            && let Some((ticket, since, copies)) = self.burying.front_mut()
+            && let Some(copy) = copies.pop_front()
         {
-            let mut run = self.buried.take();
-            self.dead_copy(copy, Some(ticket), &mut run);
-            self.buried = run;
+            let (ticket, since) = (*ticket, *since);
+            self.burying_bytes -= waiting_len(&copy);
+            if self.core.dead_due(&copy, since) {
+                let mut run = self.buried.take();
+                self.dead_copy(copy, Some(ticket), &mut run);
+                self.buried = run;
+            } else {
+                self.abandon_dead(&copy.group, copy.generation, copy.address, None, None);
+            }
+            let next = self
+                .burying
+                .front()
+                .and_then(|(_, _, copies)| copies.front())
+                .map(|copy| self.index.locate(copy.address).map(|l| l.start));
+            let same_run = next.flatten().is_some_and(|start| {
+                self.buried
+                    .as_ref()
+                    .is_some_and(|(cached, _)| *cached == start)
+            });
+            if next.is_none() {
+                self.burying.pop_front();
+                self.release_ticket(ticket, Ok(()));
+            } else if !same_run {
+                self.burying.rotate_left(1);
+            }
+            if !same_run {
+                self.buried = None;
+            }
+        }
+        self.buried = self.buried.take().filter(|(_, read)| read.is_ok());
+    }
+
+    fn abandon_burying(&mut self, error: Error) {
+        for (ticket, _, copies) in std::mem::take(&mut self.burying) {
+            for copy in copies {
+                let failed = Some(error.clone());
+                self.abandon_dead(
+                    &copy.group,
+                    copy.generation,
+                    copy.address,
+                    Some(ticket),
+                    failed,
+                );
+            }
             self.release_ticket(ticket, Ok(()));
         }
-        if self.burying.is_empty() {
-            self.buried = None;
-        }
+        self.burying_bytes = 0;
+        self.buried = None;
     }
 
     fn dead_copy(&mut self, mut dead: DeadCopy, ticket: Option<u64>, run: &mut Cached) {
@@ -1458,7 +1529,9 @@ impl<F: Fs + Clone> Engine<F> {
     ) {
         let actions = self.core.abandon(group, generation, &[address], false);
         self.act(actions, None);
-        if let (Some(ticket), Some(error)) = (ticket, error) {
+        let result = error.map_or(Ok(()), Err);
+        self.resolve_await((group.to_owned(), address), &result);
+        if let (Some(ticket), Err(error)) = (ticket, result) {
             self.hold_ticket(ticket);
             self.release_ticket(ticket, Err(error));
         }
@@ -1513,6 +1586,7 @@ impl<F: Fs + Clone> Engine<F> {
         controls: Vec<Control>,
         ticket: Option<u64>,
     ) {
+        self.deleting += controls.iter().filter(|c| deletes(c)).count();
         if request_len(&messages, &controls) > BLOCK_CAP {
             if let Some(ticket) = ticket {
                 self.hold_ticket(ticket);
@@ -1653,6 +1727,7 @@ impl<F: Fs + Clone> Engine<F> {
             written.offset + landing.total,
             landing.total - BLOCK_HEADER_LEN as u64,
             landing.commit_ms,
+            !landing.controls.is_empty(),
         );
         if !landing.runs.is_empty() && !self.index.has(written.segment) {
             match self
@@ -1684,6 +1759,9 @@ impl<F: Fs + Clone> Engine<F> {
             });
         }
         for control in landing.controls {
+            if deletes(&control) {
+                self.deleting -= 1;
+            }
             match control {
                 Control::Record(record) => {
                     let settled = settled_key(&record);
@@ -1769,6 +1847,9 @@ impl<F: Fs + Clone> Engine<F> {
         let failed = Err(error.clone());
         let mut actions = Vec::new();
         for control in controls {
+            if deletes(control) {
+                self.deleting -= 1;
+            }
             match control {
                 Control::Record(
                     Record::Ack {
@@ -1830,6 +1911,7 @@ impl<F: Fs + Clone> Engine<F> {
         self.stopped = true;
         self.queue.clear();
         self.burying.clear();
+        self.burying_bytes = 0;
         self.buried = None;
         self.awaits.clear();
         self.waiters.clear();
@@ -1843,7 +1925,7 @@ impl<F: Fs + Clone> Engine<F> {
         }
     }
 
-    fn wrote(&mut self, segment: SegmentId, end: u64, body: u64, commit_ms: u64) {
+    fn wrote(&mut self, segment: SegmentId, end: u64, body: u64, commit_ms: u64, controls: bool) {
         if let Some(old) = self.active.filter(|a| *a != segment) {
             self.sealed(old);
         }
@@ -1858,9 +1940,11 @@ impl<F: Fs + Clone> Engine<F> {
             bodies: 0,
             carried: 0,
             first_ms: commit_ms,
+            controls: false,
             sealed: false,
             segments: BTreeSet::from([segment]),
         });
+        info.controls |= controls;
         info.len = end;
         info.bodies += body;
         self.written += BLOCK_HEADER_LEN as u64 + body;
@@ -2071,6 +2155,7 @@ impl<F: Fs + Clone> Engine<F> {
             bodies: output.bodies,
             carried: output.carried,
             first_ms: output.first_ms,
+            controls: false,
             sealed: true,
             segments: held,
         };
@@ -2255,6 +2340,21 @@ fn settled_key(record: &Record) -> Option<(String, Address)> {
     }
 }
 
+fn deletes(control: &Control) -> bool {
+    matches!(
+        control,
+        Control::Record(Record::Tombstone { .. } | Record::Forget { .. })
+    )
+}
+
+fn waiting_len(copy: &DeadCopy) -> usize {
+    size_of::<DeadCopy>()
+        + copy.group.len()
+        + copy.stream.len()
+        + copy.dead_stream.len()
+        + copy.error.as_ref().map_or(0, String::len)
+}
+
 fn dead_len(dead_stream: &str, copy: &Message, ack: &Control) -> usize {
     EMPTY_BODY + records::message_len(dead_stream, copy) + records::control_len(ack)
 }
@@ -2395,6 +2495,7 @@ mod tests {
             bodies: 0,
             carried: 0,
             first_ms: 0,
+            controls: false,
             sealed: true,
             segments: BTreeSet::new(),
         };

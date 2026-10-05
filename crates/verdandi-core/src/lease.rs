@@ -224,6 +224,24 @@ impl Core {
             .collect()
     }
 
+    pub fn dead_due(&self, copy: &DeadCopy, since: MessageId) -> bool {
+        self.generation(&copy.group) == Some(copy.generation)
+            && matches!(
+                self.mem
+                    .get(&copy.group)
+                    .and_then(|m| m.holds.get(&copy.address)),
+                Some(Hold::DeadPending(Some(_)))
+            )
+            && self
+                .state
+                .tombstone(&copy.stream)
+                .is_none_or(|t| copy.id > t)
+            && self
+                .state
+                .tombstone(&copy.dead_stream)
+                .is_none_or(|t| t <= since)
+    }
+
     pub fn defer_dead(&mut self, group: &str, address: Address) {
         if let Some(hold) = self
             .mem
@@ -564,6 +582,19 @@ mod tests {
         sync(&mut core, actions, now);
         assert!(take(&mut core, "g", "s", 1, 1, now).is_empty());
         assert_eq!(take(&mut core, "x", "s.dead.g", 1, 2, now).len(), 1);
+    }
+
+    #[test]
+    fn the_fifth_failure_of_a_deleted_message_makes_no_dead_copy() {
+        let mut core = Core::new(INC);
+        publish(&mut core, "s", addr(1, 0), 1, 1);
+        let now = fail_to(&mut core, MAX_FAILURES, 0);
+        let delete = Record::Tombstone {
+            stream: "s".into(),
+            up_to: id(1, 0),
+        };
+        core.apply(delete, now);
+        assert_eq!(core.tick(now), []);
     }
 
     #[test]

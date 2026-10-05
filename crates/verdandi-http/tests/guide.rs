@@ -201,7 +201,11 @@ async fn root_json_gives_node_copies_streams_groups_warnings_and_links() {
         body["groups"],
         json!([{"name": "billing", "provisional": true}])
     );
-    assert_eq!(strings(&body["warnings"]), [OPEN_MODE]);
+    let warnings: Vec<String> = strings(&body["warnings"])
+        .into_iter()
+        .filter(|w| !w.starts_with("disk space low: ") && !w.starts_with("disk full in about "))
+        .collect();
+    assert_eq!(warnings, [OPEN_MODE], "{body}");
     for link in [
         "guide", "openapi", "publish", "take", "ack", "settle", "read",
     ] {
@@ -356,7 +360,7 @@ async fn root_warns_of_a_dropped_dead_copy_and_names_its_stream_and_group() {
         .expect("reply")
         .expect("append");
     log.close().await;
-    let node = kit::start_on(fs, dir, &TestClock::new(3_000)).await;
+    let node = kit::start_on(fs.clone(), dir, &TestClock::new(3_000)).await;
     assert_eq!(
         call(node.get("/s/s?group=g&limit=1")).await.status,
         StatusCode::NO_CONTENT
@@ -376,6 +380,23 @@ async fn root_warns_of_a_dropped_dead_copy_and_names_its_stream_and_group() {
         found,
         format!("dead copy dropped: message {id} of stream s for group g")
     );
+    call(node.post("/s/t", vec![b'v'; 100 << 10])).await;
+    fs.set_capacity(fs.used() + rate(&node).await * 3600);
+    let warnings = strings(&call(node.get("/")).await.body["warnings"]);
+    let order: Vec<Option<usize>> = warnings
+        .iter()
+        .map(|w| {
+            [
+                OPEN_MODE,
+                "dead copy dropped: ",
+                "disk space low: ",
+                "disk full in about ",
+            ]
+            .iter()
+            .position(|p| w.starts_with(p))
+        })
+        .collect();
+    assert_eq!(order, [Some(0), Some(1), Some(2), Some(3)], "{warnings:?}");
     node.stop().await;
 }
 
@@ -806,9 +827,49 @@ async fn root_warns_early_when_the_disk_fills_within_24_hours_and_when_under_20_
     assert_eq!(warnings[0], OPEN_MODE);
     assert_eq!(early(&warnings, "disk full in about "), 1, "{warnings:?}");
     assert_eq!(early(&warnings, "disk space low: "), 0, "{warnings:?}");
+    let per_s = rate(&node).await;
+    fs.set_capacity(fs.used() + per_s * 2 * 3600);
+    let warnings = strings(&call(node.get("/")).await.body["warnings"]);
+    let full: Vec<&String> = warnings
+        .iter()
+        .filter(|w| w.starts_with("disk full in about "))
+        .collect();
+    assert_eq!(full.len(), 1, "{warnings:?}");
+    assert!(
+        full[0].contains(" hours at the current write rate"),
+        "{warnings:?}"
+    );
+    fs.set_capacity(fs.used() + per_s * 25 * 3600);
+    let warnings = strings(&call(node.get("/")).await.body["warnings"]);
+    assert_eq!(early(&warnings, "disk full in about "), 0, "{warnings:?}");
     fs.set_capacity(fs.used() + fs.used() / 9);
     let warnings = strings(&call(node.get("/")).await.body["warnings"]);
     assert_eq!(early(&warnings, "disk space low: "), 1, "{warnings:?}");
+    fs.set_capacity(fs.used() + (1 << 20));
+    let warnings = strings(&call(node.get("/")).await.body["warnings"]);
+    let full = warnings
+        .iter()
+        .find(|w| w.starts_with("disk full in about "));
+    assert!(
+        full.is_some_and(|w| w.contains(" minutes at the current write rate")),
+        "{warnings:?}"
+    );
+    fs.set_capacity(fs.used() + per_s / 2);
+    let warnings = strings(&call(node.get("/")).await.body["warnings"]);
+    assert!(
+        warnings
+            .iter()
+            .any(|w| w.starts_with("disk full in about 1 minute at ")),
+        "{warnings:?}"
+    );
+    fs.set_capacity(fs.used());
+    let warnings = strings(&call(node.get("/")).await.body["warnings"]);
+    assert_eq!(
+        early(&warnings, "disk full, 0 bytes free; "),
+        1,
+        "{warnings:?}"
+    );
+    assert_eq!(early(&warnings, "disk full in about "), 0, "{warnings:?}");
     node.stop().await;
 }
 
@@ -851,7 +912,7 @@ async fn guide_limits_match_what_the_server_enforces() {
         "curl -N \"http://127.0.0.1:",
         "/s/orders?from=now&follow\"",
         "409 the receipt is stale or does not hold the id, the group changed, or a replay is not yet durable. Read next.",
-        "413 a message is over 1 MiB, a batch is over 32 MiB, the request is over 16 MiB, or dead originals are over 64 MiB. Read next.",
+        "413 a message is over 1 MiB, a batch is over 32 MiB, or the request is over 16 MiB. Read next.",
         "503 the node is starting or stopping, or the disk is full. Retry later.",
         "Every error body from a route is JSON:",
     ] {
