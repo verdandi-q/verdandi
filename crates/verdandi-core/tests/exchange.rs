@@ -1,6 +1,6 @@
 use verdandi_core::cluster::controller::Floor;
 use verdandi_core::cluster::view::{
-    Body, Head, State, Update, View, encode_digest, encode_updates,
+    Body, Head, State, Update, View, encode_digest, encode_lost, encode_updates,
 };
 
 fn full_body(disk: u64, members: &[u64], holds: u64) -> Body {
@@ -27,7 +27,8 @@ fn full_body(disk: u64, members: &[u64], holds: u64) -> Body {
         holds,
         debt: 0,
         count: 3,
-        members: members.len() as u64,
+        era: 1,
+        epoch: 9,
         floor: Floor { epoch: 1, value: 3 },
         domains: 42,
         quiet: true,
@@ -35,10 +36,12 @@ fn full_body(disk: u64, members: &[u64], holds: u64) -> Body {
         unreachable: vec![1, 2],
         signals: 0,
         remaining: 0,
+        drained: true,
+        can_found: false,
     }
 }
 
-fn exchange(n: u64) -> usize {
+fn exchange(n: u64, lost: u64) -> usize {
     let members: Vec<u64> = (1..=n).collect();
     let fill = |me: u64, holds: u64| {
         let mut view = View::new(me, 1, full_body(me, &members, holds), 0, 0);
@@ -67,17 +70,24 @@ fn exchange(n: u64) -> usize {
             .count(),
         members.len() - 1
     );
+    let lost: Vec<(u64, u64)> = (1..=lost).map(|d| (d, 1)).collect();
     encode_digest(&b.digest()).len()
         + encode_updates(&a.answer(&b.digest())).len()
         + encode_digest(&a.digest()).len()
         + encode_updates(&b.answer(&a.digest())).len()
+        + 2 * encode_lost(&lost).len()
 }
 
 #[test]
 fn one_exchange_up_to_the_largest_cluster_fits_in_one_frame() {
     for members in [50, 150] {
-        let bytes = exchange(members);
-        println!("EXCHANGE BYTES members={members} bytes={bytes}");
-        assert!(bytes < 65_536, "members={members} bytes={bytes}");
+        for lost in [0, members / 2] {
+            let bytes = exchange(members, lost);
+            println!("EXCHANGE BYTES members={members} lost={lost} bytes={bytes}");
+            assert!(
+                bytes < 65_536,
+                "members={members} lost={lost} bytes={bytes}"
+            );
+        }
     }
 }

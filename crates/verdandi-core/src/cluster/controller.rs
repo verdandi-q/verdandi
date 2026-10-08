@@ -1,5 +1,5 @@
-use std::collections::BTreeSet;
-
+use super::fence::confirmed;
+use super::members::Members;
 use super::view::{SAMPLE_MS, View};
 
 pub const QUIET_PERIOD: u64 = 6 * 3_600_000;
@@ -114,10 +114,12 @@ pub fn refuse(committed: u16, format_max: u16) -> bool {
     committed > format_max
 }
 
-fn member_set(view: &View, accepted: &BTreeSet<u64>) -> usize {
-    view.live()
-        .map(|(_, e)| usize::try_from(e.body.members).unwrap_or(usize::MAX))
-        .fold(view.member_set(accepted), usize::max)
+fn at_epoch(view: &View, list: &Members) -> bool {
+    let voters = view
+        .live()
+        .filter(|(disk, e)| list.has(*disk) && (e.body.era, e.body.epoch) == list.key())
+        .count();
+    confirmed(voters, list.members.len())
 }
 
 #[derive(Clone, Debug)]
@@ -183,7 +185,13 @@ impl Controller {
         changed
     }
 
-    pub fn decide(&mut self, view: &View, accepted: &BTreeSet<u64>, run_ms: u64) -> Option<Floor> {
+    pub fn decide(
+        &mut self,
+        view: &View,
+        list: &Members,
+        acts: bool,
+        run_ms: u64,
+    ) -> Option<Floor> {
         let peers: Vec<_> = view.live().map(|(_, e)| &e.body).collect();
         for body in &peers {
             self.merge(body.floor);
@@ -197,10 +205,10 @@ impl Controller {
             return Some(self.floor);
         }
         let c = self.count;
-        let quiet = !peers.is_empty()
+        let quiet = acts
             && peers.iter().all(|b| b.quiet && b.count == c && b.debt == 0)
             && c < self.floor.value
-            && 2 * peers.len() > member_set(view, accepted);
+            && at_epoch(view, list);
         let sample = (c, run_ms / SAMPLE_MS);
         match self.streak {
             _ if !quiet => self.streak = None,
@@ -228,7 +236,7 @@ impl Controller {
         })
     }
 
-    pub fn commit(&mut self, view: &View, accepted: &BTreeSet<u64>, run_ms: u64) -> u16 {
+    pub fn commit(&mut self, view: &View, list: &Members, acts: bool, run_ms: u64) -> u16 {
         let seen = view
             .live()
             .map(|(_, e)| e.body.committed)
@@ -241,7 +249,7 @@ impl Controller {
             view.entry(*disk).is_some_and(|e| e.body.format_max >= next)
                 && view.alive_for(*disk, run_ms) >= SOAK_MS
         });
-        if ready && 2 * live.len() > member_set(view, accepted) {
+        if ready && acts && at_epoch(view, list) {
             self.committed = next;
         }
         self.committed
@@ -401,7 +409,7 @@ mod tests {
         assert_eq!(ctl.sample(&view, 3, 1.0, start).count, 3);
         let alive: Vec<u64> = (2..=11).collect();
         beat(&mut view, &alive, 2, FAIL_MS, start);
-        view.tick(FAIL_MS, start);
+        view.tick(FAIL_MS, start, &[]);
         assert!(view.absent(12));
         assert_eq!(ctl.sample(&view, 3, 1.0, start).count, 5);
         let mut now = FAIL_MS;
@@ -412,12 +420,12 @@ mod tests {
         ] {
             now += 1;
             beat(&mut view, &alive, now, now, run);
-            view.tick(now, run);
+            view.tick(now, run, &[]);
             assert_eq!(ctl.sample(&view, 3, 1.0, run).count, 5, "run {run}");
         }
         now += 1;
         beat(&mut view, &alive, now, now, start + QUIET_PERIOD + 1);
-        view.tick(now, start + QUIET_PERIOD + 1);
+        view.tick(now, start + QUIET_PERIOD + 1, &[]);
         assert_eq!(ctl.sample(&view, 3, 1.0, start + QUIET_PERIOD + 1).count, 3);
     }
 
@@ -428,7 +436,7 @@ mod tests {
         let start = QUIET_PERIOD;
         assert_eq!(ctl.sample(&view, 3, 1.0, start).count, 3);
         beat(&mut view, &[2], 2, FAIL_MS, start);
-        view.tick(FAIL_MS, start);
+        view.tick(FAIL_MS, start, &[]);
         assert!(view.absent(3));
         assert_eq!(ctl.sample(&view, 3, 1.0, start + 1).count, 3);
         beat(&mut view, &[2], 3, FAIL_MS + 1, start + QUIET_PERIOD - 1);
@@ -463,15 +471,15 @@ mod tests {
         leave(&mut view, 4, 0, 0);
         leave(&mut view, 5, 2, 0);
         leave(&mut view, 6, 2, 0);
-        view.drained(6);
-        view.tick(0, window - 1);
+        view.drained(6, 0, 0);
+        view.tick(0, window - 1, &[]);
         assert_eq!(view.losses(0), 0);
         view.merge(
             &[update(5, 2, 0, State::Alive, member(5, GB))],
             0,
             window - 1,
         );
-        view.tick(0, window);
+        view.tick(0, window, &[]);
         assert_eq!(view.losses(0), 2);
         assert!(view.absent(2) && view.absent(4) && !view.absent(5));
     }
@@ -486,15 +494,31 @@ mod tests {
             state: State::Dead,
             ..head
         };
-        view.merge(&[Update { disk: 2, head: dead, body: None }], 0, hour);
+        view.merge(
+            &[Update {
+                disk: 2,
+                head: dead,
+                body: None,
+            }],
+            0,
+            hour,
+        );
         let back = Head {
             heartbeat: head.heartbeat + 5,
             ..head
         };
-        view.merge(&[Update { disk: 2, head: back, body: None }], 0, hour + 2 * JOIN_MS);
+        view.merge(
+            &[Update {
+                disk: 2,
+                head: back,
+                body: None,
+            }],
+            0,
+            hour + 2 * JOIN_MS,
+        );
         assert!(!view.absent(2));
         leave(&mut view, 2, 1, 3 * hour);
-        view.tick(0, 3 * hour + window);
+        view.tick(0, 3 * hour + window, &[]);
         assert_eq!(view.losses(0), 1);
         assert!(!view.quiet(9 * hour + window - 1, QUIET_PERIOD));
         assert!(view.quiet(9 * hour + window + 1, QUIET_PERIOD));
@@ -520,14 +544,17 @@ mod tests {
         assert_eq!(ctl.floor, Floor { epoch: 1, value: 3 });
     }
 
-    fn decide(
-        ctl: &mut Controller,
-        view: &View,
-        accepted: &BTreeSet<u64>,
-        at: &mut u64,
-    ) -> Option<Floor> {
+    fn list(members: impl IntoIterator<Item = u64>) -> Members {
+        Members {
+            genesis: 1,
+            members: members.into_iter().collect(),
+            ..Members::default()
+        }
+    }
+
+    fn decide(ctl: &mut Controller, view: &View, list: &Members, at: &mut u64) -> Option<Floor> {
         *at += SAMPLE_MS;
-        ctl.decide(view, accepted, *at)
+        ctl.decide(view, list, true, *at)
     }
 
     #[test]
@@ -536,14 +563,14 @@ mod tests {
         report(&mut view, &[1, 2, 3], 2, 0);
         let mut ctl = Controller::new(true, Floor { epoch: 0, value: 4 }, 1);
         ctl.count = 2;
-        assert_eq!(ctl.decide(&view, &BTreeSet::new(), SAMPLE_MS), None);
-        assert_eq!(ctl.decide(&view, &BTreeSet::new(), SAMPLE_MS + 1), None);
-        assert_eq!(ctl.decide(&view, &BTreeSet::new(), 3 * SAMPLE_MS), None);
+        assert_eq!(ctl.decide(&view, &list(1..=3), true, SAMPLE_MS), None);
+        assert_eq!(ctl.decide(&view, &list(1..=3), true, SAMPLE_MS + 1), None);
+        assert_eq!(ctl.decide(&view, &list(1..=3), true, 3 * SAMPLE_MS), None);
         ctl.count = 3;
         report(&mut view, &[1, 2, 3], 3, 0);
-        assert_eq!(ctl.decide(&view, &BTreeSet::new(), 4 * SAMPLE_MS), None);
+        assert_eq!(ctl.decide(&view, &list(1..=3), true, 4 * SAMPLE_MS), None);
         assert_eq!(
-            ctl.decide(&view, &BTreeSet::new(), 5 * SAMPLE_MS),
+            ctl.decide(&view, &list(1..=3), true, 5 * SAMPLE_MS),
             Some(Floor { epoch: 1, value: 3 })
         );
     }
@@ -569,10 +596,10 @@ mod tests {
         for m in all {
             set(&mut view, m, 0, |b| b.quiet = false);
         }
-        assert_eq!(decide(&mut ctl, &view, &BTreeSet::new(), &mut at), None);
+        assert_eq!(decide(&mut ctl, &view, &list(all), &mut at), None);
         leave(&mut view, 4, 0, 0);
         for _ in 0..3 {
-            assert_eq!(decide(&mut ctl, &view, &BTreeSet::new(), &mut at), None);
+            assert_eq!(decide(&mut ctl, &view, &list(all), &mut at), None);
         }
         assert_eq!(ctl.floor, Floor { epoch: 1, value: 4 });
     }
@@ -583,53 +610,90 @@ mod tests {
         let mut ctl = Controller::new(true, START, 1);
         let mut at = 0;
         report(&mut view, &[1, 2], 4, 0);
-        assert_eq!(decide(&mut ctl, &view, &BTreeSet::new(), &mut at), None);
+        assert_eq!(decide(&mut ctl, &view, &list(1..=4), &mut at), None);
         report(&mut view, &[3], 4, 0);
         assert_eq!(
-            decide(&mut ctl, &view, &BTreeSet::new(), &mut at),
+            decide(&mut ctl, &view, &list(1..=4), &mut at),
             Some(Floor { epoch: 0, value: 4 })
         );
     }
 
     #[test]
-    fn a_quiet_fall_needs_more_than_half_of_the_member_set() {
+    fn a_quiet_fall_needs_more_than_half_of_the_list_at_its_epoch() {
         let mut view = cluster(5, GB);
         beat(&mut view, &[2], 2, FAIL_MS, 0);
-        view.tick(FAIL_MS, 0);
+        view.tick(FAIL_MS, 0, &[]);
         report(&mut view, &[1, 2], 2, 0);
         let mut ctl = Controller::new(true, Floor { epoch: 0, value: 3 }, 1);
         let mut at = 0;
         ctl.count = 2;
         for _ in 0..5 {
-            assert_eq!(decide(&mut ctl, &view, &BTreeSet::new(), &mut at), None);
+            assert_eq!(decide(&mut ctl, &view, &list(1..=5), &mut at), None);
         }
-        assert_eq!(view.member_set(&BTreeSet::new()), 5);
-        let accepted = BTreeSet::from([3, 4]);
-        assert_eq!(decide(&mut ctl, &view, &accepted, &mut at), None);
+        assert_eq!(decide(&mut ctl, &view, &list([1, 2, 3]), &mut at), None);
         assert_eq!(
-            decide(&mut ctl, &view, &accepted, &mut at),
+            decide(&mut ctl, &view, &list([1, 2, 3]), &mut at),
             Some(Floor { epoch: 1, value: 2 })
         );
 
         let mut view = cluster(12, GB);
         let early: Vec<u64> = (2..=11).collect();
         beat(&mut view, &[12], 2, FAIL_MS, 0);
-        view.tick(FAIL_MS, 0);
+        view.tick(FAIL_MS, 0, &[]);
         let late: Vec<Update> = (13..=22)
             .map(|p| update(p, 1, 1, State::Alive, member(p, GB)))
             .collect();
         view.merge(&late, FAIL_MS, 1);
         assert!(early.iter().all(|m| view.absent(*m)));
         assert_eq!(view.live().count(), 12);
-        assert_eq!(view.member_set(&BTreeSet::new()), 12);
         let live: Vec<u64> = view.live().map(|(d, _)| d).collect();
         report(&mut view, &live, 3, 1);
         let mut ctl = Controller::new(true, Floor { epoch: 0, value: 4 }, 1);
-        let mut at = 0;
         ctl.count = 3;
-        assert_eq!(decide(&mut ctl, &view, &BTreeSet::new(), &mut at), None);
+        let mut at = 0;
+        let mut other = view.clone();
+        for m in [13, 14] {
+            set(&mut other, m, 1, |b| b.epoch = 1);
+        }
+        for _ in 0..3 {
+            assert_eq!(decide(&mut ctl, &other, &list(1..=22), &mut at), None);
+        }
+        let mut debtor = view.clone();
+        let joiner = Body {
+            epoch: 1,
+            debt: 1,
+            count: 3,
+            quiet: true,
+            ..member(23, GB)
+        };
+        debtor.merge(&[update(23, 1, 1, State::Alive, joiner)], FAIL_MS, 1);
+        let mut ctl = Controller::new(true, Floor { epoch: 0, value: 4 }, 1);
+        ctl.count = 3;
+        for _ in 0..3 {
+            assert_eq!(decide(&mut ctl, &debtor, &list(1..=22), &mut at), None);
+        }
+        let mut joined = view.clone();
+        let joiners: Vec<Update> = (31..=34)
+            .map(|p| {
+                let body = Body {
+                    count: 3,
+                    quiet: true,
+                    ..member(p, GB)
+                };
+                update(p, 1, 1, State::Alive, body)
+            })
+            .collect();
+        joined.merge(&joiners, FAIL_MS, 1);
+        let mut ctl = Controller::new(true, Floor { epoch: 0, value: 4 }, 1);
+        ctl.count = 3;
+        for _ in 0..3 {
+            assert_eq!(decide(&mut ctl, &joined, &list(1..=30), &mut at), None);
+        }
+        let mut ctl = Controller::new(true, Floor { epoch: 0, value: 4 }, 1);
+        ctl.count = 3;
+        assert_eq!(decide(&mut ctl, &view, &list(1..=22), &mut at), None);
         assert_eq!(
-            decide(&mut ctl, &view, &BTreeSet::new(), &mut at),
+            decide(&mut ctl, &view, &list(1..=22), &mut at),
             Some(Floor { epoch: 1, value: 3 })
         );
     }
@@ -645,7 +709,7 @@ mod tests {
                 let peers: Vec<u64> = live.iter().copied().filter(|d| d != me).collect();
                 let mut old = view(*me, &others, 0, 0);
                 beat(&mut old, &peers, 2, FAIL_MS, FAIL_MS);
-                old.tick(FAIL_MS, FAIL_MS);
+                old.tick(FAIL_MS, FAIL_MS, &[]);
                 let (mut back, _) = View::restored(*me, 2, body(*me), 0, hour, &old.durable(0))
                     .expect("the state decodes");
                 let alive: Vec<Update> = peers
@@ -675,36 +739,55 @@ mod tests {
                 .all(|u| ![4, 5, 7].contains(&u.disk))
         );
         beat(&mut h, &[1, 2], 3, FAIL_MS, hour + FAIL_MS);
-        h.tick(FAIL_MS, hour + FAIL_MS);
+        h.tick(FAIL_MS, hour + FAIL_MS, &[]);
         report(&mut h, &[1, 2, 8], 3, hour + FAIL_MS);
         let mut ctl = Controller::new(true, Floor { epoch: 0, value: 4 }, 1);
         ctl.count = 3;
         let mut at = hour + FAIL_MS;
         for _ in 0..3 {
-            assert_eq!(decide(&mut ctl, &h, &BTreeSet::new(), &mut at), None);
+            assert_eq!(decide(&mut ctl, &h, &list(1..=7), &mut at), None);
         }
     }
 
     #[test]
-    fn a_quiet_fall_and_a_commit_use_the_largest_member_set_that_a_live_node_reports() {
+    fn a_body_at_the_same_epoch_of_another_era_does_not_count() {
+        let mut view = cluster(3, GB);
+        report(&mut view, &[1, 2, 3], 2, 0);
+        for m in 1..=3 {
+            set(&mut view, m, 0, |b| b.epoch = 3);
+        }
+        let list = Members {
+            era: 1,
+            epoch: 3,
+            ..list(1..=3)
+        };
+        let mut ctl = Controller::new(true, Floor { epoch: 0, value: 3 }, 1);
+        ctl.count = 2;
+        let mut at = 0;
+        for _ in 0..3 {
+            assert_eq!(decide(&mut ctl, &view, &list, &mut at), None);
+        }
+    }
+
+    #[test]
+    fn a_quiet_fall_and_a_commit_need_a_node_that_acts() {
         let mut view = cluster(3, GB);
         report(&mut view, &[1, 2, 3], 2, 0);
         for m in 1..=3 {
             set(&mut view, m, 0, |b| b.format_max = 2);
         }
-        set(&mut view, 2, 0, |b| b.members = 6);
         let mut ctl = Controller::new(true, Floor { epoch: 0, value: 3 }, 1);
         ctl.count = 2;
-        let mut at = 0;
-        for _ in 0..3 {
-            assert_eq!(decide(&mut ctl, &view, &BTreeSet::new(), &mut at), None);
+        for at in 1..=3 {
+            assert_eq!(ctl.decide(&view, &list(1..=3), false, at * SAMPLE_MS), None);
         }
-        assert_eq!(ctl.commit(&view, &BTreeSet::new(), SOAK_MS), 1);
-        set(&mut view, 2, 0, |b| b.members = 5);
-        assert_eq!(ctl.commit(&view, &BTreeSet::new(), SOAK_MS), 2);
-        assert_eq!(decide(&mut ctl, &view, &BTreeSet::new(), &mut at), None);
+        assert_eq!(ctl.commit(&view, &list(1..=3), false, SOAK_MS), 1);
+        assert_eq!(ctl.commit(&view, &list(1..=6), true, SOAK_MS), 1);
+        assert_eq!(ctl.commit(&view, &list(1..=3), true, SOAK_MS), 2);
+        let mut at = 3 * SAMPLE_MS;
+        assert_eq!(decide(&mut ctl, &view, &list(1..=3), &mut at), None);
         assert_eq!(
-            decide(&mut ctl, &view, &BTreeSet::new(), &mut at),
+            decide(&mut ctl, &view, &list(1..=3), &mut at),
             Some(Floor { epoch: 1, value: 2 })
         );
     }
@@ -717,7 +800,7 @@ mod tests {
         assert_eq!(ctl.sample(&view, 3, 1.0, start).count, 3);
         let alive: Vec<u64> = (2..=11).collect();
         beat(&mut view, &alive, 2, FAIL_MS, start);
-        view.tick(FAIL_MS, start);
+        view.tick(FAIL_MS, start, &[]);
         assert_eq!(ctl.sample(&view, 3, 1.0, start).count, 5);
         let (back, count) = View::restored(
             1,
@@ -743,17 +826,17 @@ mod tests {
         let mut at = 0;
         ctl.count = 2;
         for _ in 0..3 {
-            assert_eq!(decide(&mut ctl, &view, &BTreeSet::new(), &mut at), None);
+            assert_eq!(decide(&mut ctl, &view, &list(1..=3), &mut at), None);
         }
         set(&mut view, 3, 0, |b| b.debt = 0);
         set(&mut view, 2, 0, |b| b.count = 1);
         for _ in 0..3 {
-            assert_eq!(decide(&mut ctl, &view, &BTreeSet::new(), &mut at), None);
+            assert_eq!(decide(&mut ctl, &view, &list(1..=3), &mut at), None);
         }
         set(&mut view, 2, 0, |b| b.count = 2);
         set(&mut view, 2, 0, |b| b.quiet = false);
         for _ in 0..3 {
-            assert_eq!(decide(&mut ctl, &view, &BTreeSet::new(), &mut at), None);
+            assert_eq!(decide(&mut ctl, &view, &list(1..=3), &mut at), None);
         }
     }
 
@@ -780,11 +863,11 @@ mod tests {
             set(&mut view, m, 0, |b| b.format_max = 2);
         }
         let mut ctl = Controller::new(true, START, 1);
-        assert_eq!(ctl.commit(&view, &BTreeSet::new(), SOAK_MS - 1), 1);
+        assert_eq!(ctl.commit(&view, &list(1..=4), true, SOAK_MS - 1), 1);
         set(&mut view, 4, 0, |b| b.format_max = 1);
-        assert_eq!(ctl.commit(&view, &BTreeSet::new(), SOAK_MS), 1);
+        assert_eq!(ctl.commit(&view, &list(1..=4), true, SOAK_MS), 1);
         set(&mut view, 4, 0, |b| b.format_max = 2);
-        assert_eq!(ctl.commit(&view, &BTreeSet::new(), SOAK_MS), 2);
+        assert_eq!(ctl.commit(&view, &list(1..=4), true, SOAK_MS), 2);
         assert!(refuse(2, 1));
         assert!(!refuse(2, 2));
     }

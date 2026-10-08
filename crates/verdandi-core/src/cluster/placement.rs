@@ -17,6 +17,7 @@ pub struct Groups {
 pub struct HolderSet {
     pub segment: u64,
     pub epoch: u64,
+    pub writer: u64,
     pub holders: BTreeSet<u64>,
 }
 
@@ -59,7 +60,10 @@ impl Groups {
 
     pub fn merge(self, other: Groups) -> Groups {
         let rank = |g: &Groups| (Reverse(g.epoch), g.hash());
-        match rank(&self).cmp(&rank(&other)).then_with(|| self.cmp(&other)) {
+        match rank(&self)
+            .cmp(&rank(&other))
+            .then_with(|| self.cmp(&other))
+        {
             Ordering::Greater => other,
             _ => self,
         }
@@ -110,10 +114,11 @@ impl HolderSet {
         self.max(other)
     }
 
-    pub fn with(&self, holders: BTreeSet<u64>) -> HolderSet {
+    pub fn with(&self, writer: u64, holders: BTreeSet<u64>) -> HolderSet {
         HolderSet {
             segment: self.segment,
             epoch: self.epoch + 1,
+            writer,
             holders,
         }
     }
@@ -124,21 +129,28 @@ pub fn ring(candidates: &[Candidate], floor: u8) -> Vec<u64> {
     let mut heavy: Vec<Candidate> = on.iter().copied().filter(|c| c.heavy.is_some()).collect();
     heavy.sort_by_key(|c| (Reverse(c.heavy), c.disk));
     for h in heavy {
-        if on.len() <= usize::from(floor) {
+        if on.len() <= usize::from(floor) + 1 {
             break;
         }
         on.retain(|c| c.disk != h.disk);
     }
     let mut domains: BTreeMap<u64, Vec<(u64, u64)>> = BTreeMap::new();
     for c in &on {
-        domains.entry(c.domain).or_default().push((c.join_ms, c.disk));
+        domains
+            .entry(c.domain)
+            .or_default()
+            .push((c.join_ms, c.disk));
     }
     for members in domains.values_mut() {
         members.sort_unstable();
     }
     let longest = domains.values().map(Vec::len).max().unwrap_or(0);
     (0..longest)
-        .flat_map(|i| domains.values().filter_map(move |m| m.get(i).map(|(_, d)| *d)))
+        .flat_map(|i| {
+            domains
+                .values()
+                .filter_map(move |m| m.get(i).map(|(_, d)| *d))
+        })
         .collect()
 }
 
@@ -224,11 +236,17 @@ impl Step<'_> {
                     .ring
                     .iter()
                     .enumerate()
-                    .filter(|(_, d)| !group.contains(d) && !group.iter().any(|m| self.paired(*m, **d)))
+                    .filter(|(_, d)| {
+                        !group.contains(d) && !group.iter().any(|m| self.paired(*m, **d))
+                    })
                     .min_by_key(|(i, d)| {
                         let count = self.count(**d);
                         let present = group.iter().any(|m| !self.apart(*m, **d));
-                        (count > 0, present, count, *i)
+                        let shares = self
+                            .groups
+                            .iter()
+                            .any(|o| o.contains(d) && group.iter().any(|m| o.contains(m)));
+                        (count > 0, present, shares, count, *i)
                     })
                     .map(|(_, d)| *d);
                 let Some(disk) = best else {
@@ -287,7 +305,9 @@ impl Step<'_> {
                 .filter(|(_, d)| {
                     !group.contains(d)
                         && self.domain.contains_key(d)
-                        && rest.iter().all(|m| self.apart(*m, **d) && !self.paired(*m, **d))
+                        && rest
+                            .iter()
+                            .all(|m| self.apart(*m, **d) && !self.paired(*m, **d))
                 })
                 .min_by_key(|(i, d)| (self.count(**d), *i))
                 .map(|(_, d)| *d);
@@ -316,7 +336,8 @@ impl Step<'_> {
                     .iter()
                     .map(|m| if m == s { disk } else { *m })
                     .collect();
-                !self.short_of_domains(&after)
+                self.count(*s) > 1
+                    && !self.short_of_domains(&after)
                     && self.groups[*g]
                         .iter()
                         .all(|m| m == s || (*m != disk && !self.paired(*m, disk)))
@@ -433,7 +454,9 @@ pub fn next(
             .collect(),
     };
     match current {
-        Some(c) if c.size == made.size && c.groups == made.groups && c.stand_ins == made.stand_ins => {
+        Some(c)
+            if c.size == made.size && c.groups == made.groups && c.stand_ins == made.stand_ins =>
+        {
             None
         }
         _ => Some(made),
@@ -534,7 +557,8 @@ mod tests {
             let mut g = first(&ring, size);
             for _ in 0..5 {
                 let moved: Vec<u64> = (1..=16).filter(|_| rng.below(3) > 0).collect();
-                if let Some(made) = next(Some(&g), &moved, &BTreeMap::new(), &BTreeSet::new(), size) {
+                if let Some(made) = next(Some(&g), &moved, &BTreeMap::new(), &BTreeSet::new(), size)
+                {
                     g = made;
                 }
                 for d in &moved {
@@ -560,7 +584,10 @@ mod tests {
             let mut grown = ring.clone();
             grown.push(10);
             let new = after(&without, &grown, 3);
-            assert!(changed(&without, &new) <= 1, "new node after loss of {lost}");
+            assert!(
+                changed(&without, &new) <= 1,
+                "new node after loss of {lost}"
+            );
         }
         let mut grown = disks.clone();
         grown.push(10);
@@ -613,6 +640,85 @@ mod tests {
         let dom = domains(&[(1, 1), (2, 1), (3, 0)]);
         let made = next(Some(&g), &[1, 2, 3], &dom, &BTreeSet::new(), 2).expect("fall");
         assert_eq!(made.groups[0], vec![1, 3]);
+        let g = Groups {
+            epoch: 1,
+            size: 3,
+            groups: vec![vec![1, 2, 3], vec![3, 4, 5]],
+            stand_ins: vec![],
+        };
+        let dom = domains(&[(1, 0), (2, 0), (3, 1), (4, 0), (5, 1)]);
+        let made = next(Some(&g), &[1, 2, 3, 4, 5], &dom, &BTreeSet::new(), 2).expect("fall");
+        assert_eq!(made.groups[0], vec![1, 3]);
+    }
+
+    #[test]
+    fn a_size_fall_keeps_every_ring_node_in_a_group_and_adds_no_member() {
+        let ring: Vec<u64> = (1..=7).collect();
+        let three = first(&ring, 3);
+        let two = after(&three, &ring, 2);
+        assert!(ring.iter().all(|d| two.of(*d).is_some()), "{two:?}");
+        for (a, b) in three.groups.iter().zip(&two.groups) {
+            assert!(b.iter().all(|m| a.contains(m)), "{three:?} {two:?}");
+        }
+    }
+
+    #[test]
+    fn holder_sets_merge_to_the_highest_epoch_and_writer_never_a_union() {
+        let set = |epoch: u64, writer: u64, holders: &[u64]| HolderSet {
+            segment: 7,
+            epoch,
+            writer,
+            holders: holders.iter().copied().collect(),
+        };
+        let low = set(2, 1, &[1, 2, 3, 9, 10]);
+        let high = set(2, 4, &[1, 2, 3]);
+        assert_eq!(low.clone().merge(high.clone()), high);
+        assert_eq!(high.clone().merge(low.clone()), high);
+        assert_eq!(high.clone().merge(set(3, 1, &[4])), set(3, 1, &[4]));
+        let mut rng = Rng(9);
+        let random = |rng: &mut Rng| {
+            let holders: Vec<u64> = (1..=6).filter(|_| rng.below(2) == 0).collect();
+            set(rng.below(3), rng.below(3), &holders)
+        };
+        for _ in 0..500 {
+            let (a, b, c) = (random(&mut rng), random(&mut rng), random(&mut rng));
+            assert_eq!(a.clone().merge(b.clone()), b.clone().merge(a.clone()));
+            assert_eq!(
+                a.clone().merge(b.clone()).merge(c.clone()),
+                a.clone().merge(b.clone().merge(c.clone()))
+            );
+            assert_eq!(a.clone().merge(a.clone()), a);
+            let merged = a.clone().merge(b.clone());
+            assert!(merged == a || merged == b);
+        }
+    }
+
+    #[test]
+    fn a_group_whose_members_all_left_refills_from_nodes_that_share_no_group() {
+        let g = Groups {
+            epoch: 1,
+            size: 3,
+            groups: vec![
+                vec![1, 2, 3],
+                vec![4, 5, 6],
+                vec![7, 8, 9],
+                vec![10, 11, 12],
+            ],
+            stand_ins: vec![],
+        };
+        let ring = [1, 2, 3, 7, 8, 9, 10, 11, 12];
+        let made = after(&g, &ring, 3);
+        let refilled = &made.groups[1];
+        for other in made
+            .groups
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != 1)
+            .map(|(_, o)| o)
+        {
+            let shared = refilled.iter().filter(|m| other.contains(m)).count();
+            assert!(shared <= 1, "{made:?}");
+        }
     }
 
     #[test]
@@ -625,7 +731,11 @@ mod tests {
                 g = made;
             }
             assert!(g.size <= MAX_COPIES);
-            assert!(g.groups.iter().all(|grp| grp.len() <= usize::from(MAX_COPIES)));
+            assert!(
+                g.groups
+                    .iter()
+                    .all(|grp| grp.len() <= usize::from(MAX_COPIES))
+            );
         }
     }
 
@@ -641,7 +751,12 @@ mod tests {
             }
             assert!(disks.iter().all(|d| made.of(*d).is_some()));
             let fresh = next(None, &disks, &BTreeMap::new(), &pairs, 3).expect("first");
-            assert!(fresh.groups.iter().all(|g| !(g.contains(&a) && g.contains(&b))));
+            assert!(
+                fresh
+                    .groups
+                    .iter()
+                    .all(|g| !(g.contains(&a) && g.contains(&b)))
+            );
         }
     }
 
@@ -649,8 +764,20 @@ mod tests {
     fn a_record_that_fits_the_ring_gives_no_next_record() {
         let disks: Vec<u64> = (1..=7).collect();
         let base = first(&disks, 3);
-        assert_eq!(next(Some(&base), &disks, &BTreeMap::new(), &BTreeSet::new(), 3), None);
-        assert!(next(Some(&base), &disks[1..], &BTreeMap::new(), &BTreeSet::new(), 3).is_some());
+        assert_eq!(
+            next(Some(&base), &disks, &BTreeMap::new(), &BTreeSet::new(), 3),
+            None
+        );
+        assert!(
+            next(
+                Some(&base),
+                &disks[1..],
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                3
+            )
+            .is_some()
+        );
     }
 
     #[test]
@@ -697,8 +824,8 @@ mod tests {
         c[0].heavy = Some(5);
         c[3].heavy = Some(9);
         c[4].heavy = Some(1);
-        assert_eq!(ring(&c, 3), vec![2, 3, 6]);
-        assert_eq!(ring(&c, 4), vec![2, 3, 6, 5]);
+        assert_eq!(ring(&c, 3), vec![2, 3, 6, 5]);
+        assert_eq!(ring(&c, 4), vec![2, 1, 6, 3, 5]);
         let three = candidates(&[1, 2, 3], |_| 0)
             .into_iter()
             .map(|c| Candidate {
@@ -714,7 +841,11 @@ mod tests {
         let a = first(&[1, 2, 3, 4], 2);
         let b = first(&[1, 2, 3, 5], 2);
         let c = after(&a, &[1, 2, 3], 2);
-        let (low, high) = if a.hash() < b.hash() { (&a, &b) } else { (&b, &a) };
+        let (low, high) = if a.hash() < b.hash() {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
         assert_eq!(high.clone().merge(low.clone()), *low);
         assert_eq!(low.clone().merge(high.clone()), *low);
         assert_eq!(a.clone().merge(c.clone()), c);
@@ -727,6 +858,7 @@ mod tests {
         let set = HolderSet {
             segment: 9,
             epoch: 0,
+            writer: 1,
             holders: BTreeSet::from([1, 2, 3]),
         };
         let all = leader(4, &set, |_| true, &BTreeSet::new()).expect("a leader");
@@ -772,7 +904,11 @@ mod tests {
             let ring_domains: BTreeSet<u64> = dom.values().copied().collect();
             for grp in &g.groups {
                 let spread: BTreeSet<u64> = grp.iter().map(|d| dom[d]).collect();
-                assert_eq!(spread.len(), grp.len().min(ring_domains.len()), "{g:?} {dom:?}");
+                assert_eq!(
+                    spread.len(),
+                    grp.len().min(ring_domains.len()),
+                    "{g:?} {dom:?}"
+                );
             }
             assert!(ring.iter().all(|d| g.of(*d).is_some()));
         }
@@ -790,7 +926,17 @@ mod tests {
 
     #[test]
     fn a_short_group_and_a_new_group_take_missing_domains_in_one_record() {
-        let dom = domains(&[(1, 0), (2, 0), (3, 0), (4, 1), (5, 2), (6, 0), (7, 0), (8, 1), (9, 2)]);
+        let dom = domains(&[
+            (1, 0),
+            (2, 0),
+            (3, 0),
+            (4, 1),
+            (5, 2),
+            (6, 0),
+            (7, 0),
+            (8, 1),
+            (9, 2),
+        ]);
         let g = Groups {
             epoch: 1,
             size: 3,
@@ -805,7 +951,8 @@ mod tests {
             groups: vec![vec![1, 4, 5]],
             stand_ins: vec![],
         };
-        let made = next(Some(&g), &[1, 4, 5, 6, 7, 8, 9], &dom, &BTreeSet::new(), 3).expect("new groups");
+        let made =
+            next(Some(&g), &[1, 4, 5, 6, 7, 8, 9], &dom, &BTreeSet::new(), 3).expect("new groups");
         for grp in &made.groups {
             let spread: BTreeSet<u64> = grp.iter().map(|d| dom[d]).collect();
             assert_eq!(spread.len(), 3, "{made:?}");

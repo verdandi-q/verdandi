@@ -1,11 +1,13 @@
-use super::controller::REPAIR_BYTES_PER_S;
+use super::controller::{MAX_COPIES, REPAIR_BYTES_PER_S};
 use std::cmp::Reverse;
+use std::collections::BTreeSet;
 
 use super::fnv;
 use super::placement::{Groups, HolderSet, mix, pick};
 
 pub const REPAIR_STEP: u64 = 8 << 20;
 pub const DIGEST_MS: u64 = 5_000;
+pub const REPAIR_SCAN_SEGMENTS: usize = 1_000;
 
 #[derive(Clone, Copy, Debug)]
 pub struct Limiter {
@@ -26,13 +28,35 @@ impl Limiter {
         self.milli = self
             .milli
             .saturating_add(gained)
-            .min(REPAIR_BYTES_PER_S * 1000);
+            .min(REPAIR_BYTES_PER_S * 500);
         self.at_ms = self.at_ms.max(now_ms);
         (self.milli / 1000).min(REPAIR_STEP)
     }
 
     pub fn spend(&mut self, bytes: u64) {
         self.milli = self.milli.saturating_sub(bytes.saturating_mul(1000));
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct OwedScan {
+    cursor: usize,
+    partial: u64,
+    full: Option<u64>,
+}
+
+impl OwedScan {
+    pub fn answer(&mut self, segments: usize, window: impl FnOnce(usize) -> u64) -> u64 {
+        self.partial = self.partial.saturating_add(window(self.cursor));
+        self.cursor += REPAIR_SCAN_SEGMENTS;
+        if self.cursor >= segments {
+            self.full = Some(self.partial);
+            self.cursor = 0;
+            self.partial = 0;
+            return self.full.unwrap_or(0);
+        }
+        self.full
+            .map_or(self.partial.max(1), |f| f.max(self.partial))
     }
 }
 
@@ -53,37 +77,56 @@ pub struct Want {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Step {
     Copy { need: usize, to: Vec<u64> },
-    Drop(HolderSet),
+    Drop(BTreeSet<u64>),
     Idle,
 }
 
 pub fn sender(set: &HolderSet, live: impl Fn(u64) -> bool) -> Option<u64> {
-    pick(&[set.segment], set.holders.iter().copied().filter(|h| live(*h)))
+    pick(
+        &[set.segment],
+        set.holders.iter().copied().filter(|h| live(*h)),
+    )
 }
 
-fn ranked(segment: u64, mut disks: Vec<u64>) -> Vec<u64> {
-    disks.sort_unstable();
-    disks.dedup();
-    disks.sort_by_cached_key(|d| Reverse(mix(fnv([segment, *d]))));
-    disks
+fn others(groups: &Groups, segment: u64, skip: impl Fn(u64) -> bool, k: usize) -> Vec<u64> {
+    let all: BTreeSet<u64> = groups
+        .groups
+        .iter()
+        .flatten()
+        .copied()
+        .filter(|d| !skip(*d))
+        .collect();
+    let mut all: Vec<u64> = all.into_iter().collect();
+    let rank = |d: &u64| Reverse(mix(fnv([segment, *d])));
+    if all.len() > k {
+        all.select_nth_unstable_by_key(k, rank);
+        all.truncate(k);
+    }
+    all.sort_by_cached_key(rank);
+    all
 }
 
-fn others(groups: &Groups, segment: u64, skip: impl Fn(u64) -> bool) -> Vec<u64> {
-    let all = groups.groups.iter().flatten().copied().filter(|d| !skip(*d));
-    ranked(segment, all.collect())
+pub fn pass(segments: usize, cursor: usize) -> impl Iterator<Item = usize> {
+    (0..segments.min(REPAIR_SCAN_SEGMENTS)).map(move |i| (cursor + i) % segments)
 }
 
-pub fn destination(held: &Held, groups: &Groups, live: impl Fn(u64) -> bool + Copy, target: usize) -> Vec<u64> {
+pub fn destination(
+    held: &Held,
+    groups: &Groups,
+    live: impl Fn(u64) -> bool + Copy,
+    target: usize,
+) -> Vec<u64> {
     let segment = held.set.segment;
     let mut dest = groups.destination(segment, held.writer, live).to_vec();
     let extra = target.saturating_sub(dest.len());
     if extra > 0 {
         let group = dest.clone();
-        dest.extend(
-            others(groups, segment, |d| group.contains(&d) || !live(d))
-                .into_iter()
-                .take(extra),
-        );
+        dest.extend(others(
+            groups,
+            segment,
+            |d| group.contains(&d) || !live(d),
+            extra,
+        ));
     }
     dest
 }
@@ -107,9 +150,12 @@ pub fn plan(
     let deficit = want.target.saturating_sub(copies);
     let need = to.len().max(deficit);
     if deficit > 0 {
-        to.extend(others(groups, set.segment, |d| {
-            dest.contains(&d) || !live(d) || has(d)
-        }));
+        to.extend(others(
+            groups,
+            set.segment,
+            |d| dest.contains(&d) || !live(d) || has(d),
+            usize::from(MAX_COPIES),
+        ));
     }
     if need > 0 && !to.is_empty() {
         return Step::Copy {
@@ -117,15 +163,16 @@ pub fn plan(
             to,
         };
     }
+    let size = usize::from(groups.size);
     let keep = if want.cold {
-        want.target.max(copies)
+        want.target.max(set.holders.len())
     } else {
         want.target
     };
     let whole = !dest.is_empty() && dest.iter().all(|m| live(*m) && has(*m));
     let extra = set.holders.iter().any(|h| !dest.contains(h));
-    if held.sealed && whole && extra && dest.len() >= keep {
-        Step::Drop(set.with(dest.into_iter().collect()))
+    if held.sealed && whole && extra && dest.len() >= keep.max(size) {
+        Step::Drop(dest.into_iter().collect())
     } else {
         Step::Idle
     }
@@ -153,7 +200,12 @@ pub fn self_drain(
                 .copied()
                 .filter(|m| *m != me && !has(*m) && serving(*m))
                 .collect();
-            let copies = h.set.holders.iter().filter(|d| serving(**d) && has(**d)).count();
+            let copies = h
+                .set
+                .holders
+                .iter()
+                .filter(|d| serving(**d) && has(**d))
+                .count();
             (!to.is_empty()).then_some((copies, h.set.segment, to))
         })
         .collect();
@@ -161,6 +213,8 @@ pub fn self_drain(
     planned.into_iter().map(|(_, id, to)| (id, to)).collect()
 }
 
+// allow: the owed answer needs the node, the target, the scan cursor and five plan inputs
+#[allow(clippy::too_many_arguments)]
 pub fn owed(
     me: u64,
     to: u64,
@@ -169,8 +223,10 @@ pub fn owed(
     live: impl Fn(u64) -> bool + Copy,
     complete: impl Fn(u64, u64) -> bool,
     draining: bool,
+    cursor: usize,
 ) -> u64 {
-    held.iter()
+    pass(held.len(), cursor)
+        .map(|i| &held[i])
         .filter(|h| {
             !(h.set.holders.contains(&to) && complete(h.set.segment, to))
                 && groups
@@ -193,6 +249,7 @@ mod tests {
         HolderSet {
             segment,
             epoch: 0,
+            writer: 1,
             holders: holders.iter().copied().collect(),
         }
     }
@@ -223,7 +280,7 @@ mod tests {
     fn the_limiter_lets_through_the_cap_in_each_five_second_window() {
         let mut limiter = Limiter::new(0);
         let demand = 4 * REPAIR_BYTES_PER_S / 100;
-        let mut windows = vec![0u64; 4];
+        let mut windows = [0u64; 4];
         for tick in 1..=2_000u64 {
             let now = tick * 10;
             let mut want = demand;
@@ -250,12 +307,53 @@ mod tests {
     }
 
     #[test]
+    fn the_first_five_second_window_after_an_idle_hour_stays_within_the_cap() {
+        let mut limiter = Limiter::new(0);
+        let start = 3_600_000;
+        let mut window = 0;
+        for tick in 1..=500u64 {
+            let now = start + tick * 10;
+            loop {
+                let got = limiter.available(now);
+                if got == 0 {
+                    break;
+                }
+                limiter.spend(got);
+                window += got;
+            }
+        }
+        let cap = 5 * REPAIR_BYTES_PER_S;
+        assert!(window * 100 <= cap * 110, "{window} of {cap}");
+        assert!(window * 100 >= cap * 90, "{window} of {cap}");
+    }
+
+    #[test]
+    fn lost_copies_rank_a_fixed_number_of_members_and_a_pass_visits_a_fixed_number_of_segments() {
+        let many: Vec<Vec<u64>> = (0..10u64)
+            .map(|i| vec![3 * i + 1, 3 * i + 2, 3 * i + 3])
+            .collect();
+        let refs: Vec<&[u64]> = many.iter().map(Vec::as_slice).collect();
+        let g = groups(&refs);
+        let s = set(7, &[1]);
+        let Step::Copy { to, .. } = plan(&held(1, &s), &g, |_| true, all, THREE) else {
+            panic!("lost copies");
+        };
+        assert_eq!(to.len(), 2 + usize::from(MAX_COPIES));
+        let seen: BTreeSet<usize> = pass(2_500, 2_000).collect();
+        assert_eq!(seen.len(), REPAIR_SCAN_SEGMENTS);
+        assert!(seen.contains(&2_000) && seen.contains(&499) && !seen.contains(&500));
+        assert_eq!(pass(10, 3).count(), 10);
+    }
+
+    #[test]
     fn no_holder_sends_for_more_than_150_of_1000_segments_on_10_holders() {
         let disks: Vec<u64> = (1..=10).map(|d| d * 0x1000_0001).collect();
         let mut sends: BTreeMap<u64, u32> = BTreeMap::new();
         for segment in 1..=1_000 {
             let s = set(segment, &disks);
-            *sends.entry(sender(&s, |_| true).expect("a sender")).or_default() += 1;
+            *sends
+                .entry(sender(&s, |_| true).expect("a sender"))
+                .or_default() += 1;
         }
         assert_eq!(sends.len(), 10);
         assert!(sends.values().all(|n| *n <= 150), "{sends:?}");
@@ -281,7 +379,10 @@ mod tests {
         let plan = self_drain(1, &held, &next, serving, all, 0, 110_000);
         let order: Vec<u64> = plan.iter().map(|(id, _)| *id).collect();
         assert_eq!(order, vec![11, 12, 10]);
-        assert!(plan.iter().all(|(_, to)| !to.contains(&1) && !to.is_empty()));
+        assert!(
+            plan.iter()
+                .all(|(_, to)| !to.contains(&1) && !to.is_empty())
+        );
         assert!(self_drain(1, &held, &next, serving, all, 110_000, 110_000).is_empty());
     }
 
@@ -304,7 +405,10 @@ mod tests {
         assert_eq!(plan(&held(1, &s), &g, |_| true, all, THREE), copy(1, &[3]));
         assert_eq!(plan(&held(1, &s), &g, |d| d != 3, all, THREE), Step::Idle);
         let other = plan(&held(8, &s), &g, |d| d != 8, all, THREE);
-        assert!(other == copy(1, &[3]) || other == copy(3, &[4, 5, 6]), "{other:?}");
+        assert!(
+            other == copy(1, &[3]) || other == copy(3, &[4, 5, 6]),
+            "{other:?}"
+        );
         let exact = set(7, &[1, 2, 3]);
         let gap = |_: u64, d: u64| d != 3;
         let Step::Copy { need, to } = plan(&held(1, &exact), &g, |_| true, gap, THREE) else {
@@ -356,19 +460,17 @@ mod tests {
         let Step::Drop(keep) = plan(&held(1, &s), &g, |_| true, all, four) else {
             panic!("a drop");
         };
-        assert_eq!(keep.holders, BTreeSet::from([1, 2, 3, to[0]]));
+        assert_eq!(keep, BTreeSet::from([1, 2, 3, to[0]]));
     }
 
     #[test]
     fn repair_drops_copies_outside_the_destination_only_when_sealed_whole_and_not_cold() {
         let g = groups(&[&[1, 2, 3], &[4, 5, 6]]);
         let s = set(7, &[9, 1, 2, 3]);
-        let expect = HolderSet {
-            segment: 7,
-            epoch: 1,
-            holders: BTreeSet::from([1, 2, 3]),
-        };
-        assert_eq!(plan(&held(1, &s), &g, |_| true, all, THREE), Step::Drop(expect));
+        assert_eq!(
+            plan(&held(1, &s), &g, |_| true, all, THREE),
+            Step::Drop(BTreeSet::from([1, 2, 3]))
+        );
         let open = Held {
             sealed: false,
             ..held(1, &s)
@@ -391,15 +493,80 @@ mod tests {
     }
 
     #[test]
+    fn a_cold_start_keeps_a_holder_that_only_the_senders_view_shows_absent() {
+        let g = groups(&[&[1, 2], &[3, 4]]);
+        let s = set(7, &[1, 2, 9]);
+        let cold = Want {
+            target: 2,
+            cold: true,
+        };
+        assert_eq!(plan(&held(1, &s), &g, |d| d != 9, all, cold), Step::Idle);
+    }
+
+    #[test]
+    fn repair_keeps_every_holder_while_the_record_has_fewer_members_than_its_size() {
+        let alone = Groups {
+            epoch: 2,
+            size: 3,
+            groups: vec![vec![1]],
+            stand_ins: vec![],
+        };
+        let s = set(7, &[1, 2, 3]);
+        let one = Want {
+            target: 1,
+            cold: false,
+        };
+        assert_eq!(plan(&held(1, &s), &alone, |d| d == 1, all, one), Step::Idle);
+        let two = Groups {
+            groups: vec![vec![1, 2]],
+            ..alone.clone()
+        };
+        assert_eq!(plan(&held(1, &s), &two, |d| d != 3, all, one), Step::Idle);
+        let short = Groups {
+            groups: vec![vec![1], vec![2, 3, 4]],
+            ..alone
+        };
+        let s = set(7, &[1, 2, 9]);
+        assert_eq!(plan(&held(1, &s), &short, |_| true, all, one), Step::Idle);
+    }
+
+    #[test]
+    fn owed_is_zero_only_after_a_whole_cycle_of_windows_shows_zero() {
+        let g = groups(&[&[1, 2, 3]]);
+        let sets: Vec<HolderSet> = (0..2_500)
+            .map(|s| set(s, if s == 1_500 { &[1, 2] } else { &[1, 2, 3] }))
+            .collect();
+        let partly: Vec<Held> = sets.iter().map(|s| held(1, s)).collect();
+        let mut scan = OwedScan::default();
+        let mut answers = Vec::new();
+        for _ in 0..3 {
+            answers.push(scan.answer(partly.len(), |c| {
+                owed(1, 3, &partly, &g, |_| true, all, true, c)
+            }));
+        }
+        assert!(answers.iter().all(|a| *a > 0), "{answers:?}");
+        assert_eq!(answers[2], 64);
+        let full: Vec<HolderSet> = (0..2_500).map(|s| set(s, &[1, 2, 3])).collect();
+        let whole: Vec<Held> = full.iter().map(|s| held(1, s)).collect();
+        let mut later = Vec::new();
+        for _ in 0..6 {
+            later.push(scan.answer(whole.len(), |c| {
+                owed(1, 3, &whole, &g, |_| true, all, true, c)
+            }));
+        }
+        assert_eq!(later, vec![64, 64, 0, 0, 0, 0]);
+    }
+
+    #[test]
     fn owed_bytes_are_the_segments_a_node_sends_that_the_target_lacks() {
         let g = groups(&[&[1, 2, 3]]);
         let sets: Vec<HolderSet> = (1..=20).map(|s| set(s, &[1, 2])).collect();
         let held: Vec<Held> = sets.iter().map(|s| held(1, s)).collect();
-        let by_one = owed(1, 3, &held, &g, |_| true, all, false);
-        let by_two = owed(2, 3, &held, &g, |_| true, all, false);
+        let by_one = owed(1, 3, &held, &g, |_| true, all, false, 0);
+        let by_two = owed(2, 3, &held, &g, |_| true, all, false, 0);
         assert_eq!(by_one + by_two, 20 * 64);
         assert!(by_one > 0 && by_two > 0);
-        assert_eq!(owed(1, 3, &held, &g, |_| true, all, true), 20 * 64);
-        assert_eq!(owed(1, 2, &held, &g, |_| true, all, true), 0);
+        assert_eq!(owed(1, 3, &held, &g, |_| true, all, true, 0), 20 * 64);
+        assert_eq!(owed(1, 2, &held, &g, |_| true, all, true, 0), 0);
     }
 }

@@ -3,6 +3,7 @@ use std::ops::Bound;
 use std::path::Path;
 
 use verdandi_core::cluster::controller::{Controller, Floor, START};
+use verdandi_core::cluster::members::{Members, Node as MemberNode};
 use verdandi_core::cluster::placement::{Groups, HolderSet, next};
 use verdandi_core::lease::Settle;
 use verdandi_sim::fault_fs::FaultFs;
@@ -80,7 +81,13 @@ fn i12_groups_holder_sets_and_floors_merge_in_any_order() {
             let ring: Vec<u64> = (1..=n).collect();
             let first = next(None, &ring, &BTreeMap::new(), &BTreeSet::new(), size).expect("first");
             records.push(first.clone());
-            if let Some(more) = next(Some(&first), &ring[1..], &BTreeMap::new(), &BTreeSet::new(), size) {
+            if let Some(more) = next(
+                Some(&first),
+                &ring[1..],
+                &BTreeMap::new(),
+                &BTreeSet::new(),
+                size,
+            ) {
                 records.push(more);
             }
         }
@@ -89,6 +96,7 @@ fn i12_groups_holder_sets_and_floors_merge_in_any_order() {
         .map(|i| HolderSet {
             segment: 7,
             epoch: i % 4,
+            writer: i % 2,
             holders: (1..=3 + i % 3).map(|d| d + i).collect(),
         })
         .collect();
@@ -107,13 +115,32 @@ fn i12_groups_holder_sets_and_floors_merge_in_any_order() {
     );
     let floor = floors.iter().copied().max();
     for _ in 0..100 {
-        assert_eq!(shuffled(&records, &mut seed).into_iter().reduce(Groups::merge), groups);
-        assert_eq!(shuffled(&sets, &mut seed).into_iter().reduce(HolderSet::merge), holders);
+        assert_eq!(
+            shuffled(&records, &mut seed)
+                .into_iter()
+                .reduce(Groups::merge),
+            groups
+        );
+        assert_eq!(
+            shuffled(&sets, &mut seed)
+                .into_iter()
+                .reduce(HolderSet::merge),
+            holders
+        );
         let mut ctl = Controller::new(true, START, 1);
         for f in shuffled(&floors, &mut seed) {
             ctl.merge(f);
         }
         assert_eq!(Some(ctl.floor), floor);
+    }
+    for a in &sets {
+        for b in sets.iter().filter(|b| b.epoch == a.epoch) {
+            let merged = a.clone().merge(b.clone());
+            assert!(
+                merged == *a || merged == *b,
+                "{a:?} {b:?} merged to {merged:?}"
+            );
+        }
     }
     for a in &records {
         assert_eq!(a.clone().merge(a.clone()), *a);
@@ -121,4 +148,39 @@ fn i12_groups_holder_sets_and_floors_merge_in_any_order() {
             assert_eq!(a.clone().merge(b.clone()), b.clone().merge(a.clone()));
         }
     }
+}
+
+#[test]
+fn i12_the_member_list_takes_only_a_higher_key_and_never_merges() {
+    let list = |epoch: u64, members: Vec<u64>| Members {
+        genesis: 1,
+        epoch,
+        members,
+        ..Members::default()
+    };
+    let lists = [
+        list(1, vec![1, 2, 3]),
+        list(2, vec![1, 2, 3, 4]),
+        list(3, vec![1, 2, 4]),
+    ];
+    let mut seed = 0x2545_f491_4f6c_dd1d;
+    for _ in 0..20 {
+        let mut node = MemberNode::new(1);
+        for l in shuffled(&lists, &mut seed) {
+            node.adopt(&l, 0);
+        }
+        assert_eq!(node.list(), &lists[2]);
+    }
+    let mut node = MemberNode::new(1);
+    assert_eq!(node.adopt(&lists[0], 0), Some(true));
+    let other = list(2, vec![1, 2, 3, 5]);
+    assert_eq!(node.adopt(&lists[1], 0), Some(false));
+    assert_eq!(node.adopt(&other, 0), None);
+    assert_eq!(node.list(), &lists[1]);
+    let foreign = Members {
+        genesis: 9,
+        ..list(3, vec![1, 9])
+    };
+    assert_eq!(node.adopt(&foreign, 0), None);
+    assert_eq!(node.list(), &lists[1]);
 }

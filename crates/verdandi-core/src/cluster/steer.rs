@@ -1,6 +1,7 @@
 use super::view::Body;
 
 pub const HEAVY_FILL: u64 = 10;
+pub const HEAVY_RATE: f64 = 1.5;
 pub const HEAVY_HOLD_MS: u64 = 600_000;
 const DAY_S: u64 = 86_400;
 
@@ -20,7 +21,9 @@ pub fn meets(me: &Body, live: &[&Body]) -> bool {
     let fill_median = median(live.iter().map(|b| fill(b)).collect());
     let rate_median = median(live.iter().map(|b| b.fill_rate).collect());
     fill(me) >= fill_median + HEAVY_FILL
-        || (me.fill_rate > rate_median && 2 * me.fill_rate >= 3 * rate_median)
+        || (rate_median > 0
+            && me.fill_rate > rate_median
+            && me.fill_rate as f64 >= HEAVY_RATE * rate_median as f64)
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -41,7 +44,12 @@ impl Hold {
     }
 }
 
-pub fn scale_hint(heavy: Option<u64>, until_full_s: Option<u64>, live: usize, floor: u8) -> Option<String> {
+pub fn scale_hint(
+    heavy: Option<u64>,
+    until_full_s: Option<u64>,
+    live: usize,
+    floor: u8,
+) -> Option<String> {
     if let Some(disk) = heavy {
         Some(format!("node {disk:016x} fills faster than its peers"))
     } else if until_full_s.is_some_and(|s| s < DAY_S) {
@@ -79,6 +87,21 @@ mod tests {
         let refs: Vec<&Body> = idle.iter().collect();
         assert!(!meets(&body(100, 60, 0), &refs));
         assert_eq!(fill(&body(0, 0, 0)), 0);
+    }
+
+    #[test]
+    fn no_node_is_heavy_by_rate_when_the_median_rate_is_zero() {
+        let nodes = [
+            body(100, 60, 0),
+            body(100, 60, 0),
+            body(100, 60, 0),
+            body(100, 60, 0),
+            body(100, 60, 7),
+            body(100, 60, 7),
+            body(100, 60, 7),
+        ];
+        let refs: Vec<&Body> = nodes.iter().collect();
+        assert!(nodes.iter().all(|n| !meets(n, &refs)));
     }
 
     #[test]

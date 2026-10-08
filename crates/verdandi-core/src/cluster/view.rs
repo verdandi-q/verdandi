@@ -54,7 +54,8 @@ pub struct Body {
     pub holds: u64,
     pub debt: u64,
     pub count: u8,
-    pub members: u64,
+    pub era: u32,
+    pub epoch: u64,
     pub floor: Floor,
     pub domains: u64,
     pub quiet: bool,
@@ -62,6 +63,8 @@ pub struct Body {
     pub unreachable: Vec<u64>,
     pub signals: u8,
     pub remaining: u32,
+    pub drained: bool,
+    pub can_found: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -132,7 +135,6 @@ pub struct View {
     losses: BTreeMap<(u64, u64), Loss>,
     deaths: BTreeSet<(u64, u64)>,
     pruned: BTreeMap<u64, (u64, u64)>,
-    drained: BTreeSet<u64>,
 }
 
 impl View {
@@ -164,7 +166,6 @@ impl View {
             losses: BTreeMap::new(),
             deaths: BTreeSet::new(),
             pruned: BTreeMap::new(),
-            drained: BTreeSet::new(),
         };
         view.note(me, run_ms);
         view
@@ -229,36 +230,28 @@ impl View {
         pairs
     }
 
-    pub fn member_set(&self, accepted: &BTreeSet<u64>) -> usize {
-        let mut joins: Vec<u64> = self
-            .members
-            .values()
-            .filter(|m| m.entry.head.state == State::Alive)
-            .filter_map(|m| m.seen_run_ms)
-            .collect();
-        let mut deaths: Vec<u64> = self
-            .members
-            .iter()
-            .filter(|(disk, m)| {
-                m.entry.head.state == State::Dead
-                    && !accepted.contains(disk)
-                    && !self.drained.contains(disk)
-            })
-            .filter_map(|(_, m)| m.absent_run_ms)
-            .collect();
-        joins.sort_unstable();
-        deaths.sort_unstable();
-        let mut replaced = 0;
-        for join in joins {
-            if deaths.get(replaced).is_some_and(|death| *death < join) {
-                replaced += 1;
-            }
+    pub fn drained(&mut self, disk: u64, now_ms: u64, run_ms: u64) {
+        if disk == self.me {
+            let mut body = self
+                .pending
+                .take()
+                .unwrap_or_else(|| self.own().body.clone());
+            body.drained = true;
+            self.pending = Some(body);
+            self.publish(now_ms, run_ms);
+        } else if let Some(m) = self.members.get_mut(&disk) {
+            m.entry.body.drained = true;
         }
-        self.live().count() + deaths.len() - replaced
     }
 
-    pub fn drained(&mut self, disk: u64) {
-        self.drained.insert(disk);
+    pub fn absent_since(&self, disk: u64) -> Option<u64> {
+        self.members.get(&disk).and_then(|m| m.absent_run_ms)
+    }
+
+    fn is_drained(&self, disk: u64) -> bool {
+        self.members
+            .get(&disk)
+            .is_some_and(|m| m.entry.body.drained && m.entry.body_key.0 == m.entry.head.restart)
     }
 
     pub fn durable(&self, count: u8) -> Vec<u8> {
@@ -279,7 +272,8 @@ impl View {
                 head.state as u8
                     | u8::from(m.seen_run_ms.is_some()) << 2
                     | u8::from(m.absent_run_ms.is_some()) << 3
-                    | u8::from(m.heard) << 4,
+                    | u8::from(m.heard) << 4
+                    | u8::from(self.is_drained(*disk)) << 5,
             );
         }
         out.extend_from_slice(&(self.pruned.len() as u32).to_le_bytes());
@@ -317,7 +311,7 @@ impl View {
             if !ids.insert(disk) {
                 return None;
             }
-            let state = match (flags & 3, flags >> 5) {
+            let state = match (flags & 3, flags >> 6) {
                 (0, 0) => State::Alive,
                 (1, 0) => State::Dead,
                 (2, 0) => State::Left,
@@ -340,7 +334,10 @@ impl View {
             let entry = Entry {
                 head,
                 body_key: (head.restart, 0),
-                body: Body::default(),
+                body: Body {
+                    drained: flags & 32 != 0,
+                    ..Body::default()
+                },
             };
             let member = Member {
                 entry,
@@ -418,7 +415,7 @@ impl View {
         self.note(me, run_ms);
     }
 
-    pub fn tick(&mut self, now_ms: u64, run_ms: u64) {
+    pub fn tick(&mut self, now_ms: u64, run_ms: u64, list: &[u64]) {
         if now_ms >= self.beat_ms + HEARTBEAT_MS {
             self.beat_ms = now_ms;
             if let Some(m) = self.members.get_mut(&self.me)
@@ -455,7 +452,7 @@ impl View {
                     && m.entry.body.remaining > 0
                     && m.entry.body.holds > 0
                     && !m.heard
-                    && !self.drained.contains(disk)
+                    && !self.is_drained(**disk)
                     && m.absent_run_ms
                         .is_some_and(|t| run_ms >= t + STOP_BUDGET_MS + JOIN_MS)
             })
@@ -476,6 +473,7 @@ impl View {
             .iter()
             .filter(|(disk, m)| {
                 **disk != self.me
+                    && !list.contains(disk)
                     && m.absent_run_ms
                         .is_some_and(|t| run_ms >= t + TOMBSTONE_HORIZON)
             })
@@ -483,7 +481,6 @@ impl View {
             .collect();
         for (disk, restart) in gone {
             self.members.remove(&disk);
-            self.drained.remove(&disk);
             self.pruned.insert(disk, (restart, run_ms));
         }
         self.pruned
@@ -580,6 +577,7 @@ impl View {
     }
 
     fn moved(&mut self, disk: u64, old: Head, now_ms: u64, run_ms: u64) {
+        let drained = self.is_drained(disk);
         let Some(m) = self.members.get_mut(&disk) else {
             return;
         };
@@ -587,9 +585,7 @@ impl View {
         if head.restart > old.restart {
             m.alive_run_ms = run_ms;
             m.rise_ms = now_ms;
-            self.drained.remove(&disk);
         }
-        let drained = self.drained.contains(&disk);
         match head.state {
             State::Alive => {
                 if old.state == State::Dead
@@ -645,7 +641,7 @@ impl View {
             && m.entry.body.holds > 0
             && !m.heard
             && m.entry.body_key.0 == m.entry.head.restart
-            && !self.drained.contains(&disk)
+            && !self.is_drained(disk)
         {
             self.losses
                 .entry((disk, m.entry.head.restart))
@@ -697,6 +693,16 @@ pub fn encode_updates(updates: &[Update]) -> Vec<u8> {
     out
 }
 
+pub fn encode_lost(lost: &[(u64, u64)]) -> Vec<u8> {
+    let lost = &lost[..lost.len().min(usize::from(u16::MAX))];
+    let mut out = (lost.len() as u16).to_le_bytes().to_vec();
+    for (disk, restart) in lost {
+        out.extend_from_slice(&disk.to_le_bytes());
+        out.extend_from_slice(&restart.to_le_bytes());
+    }
+    out
+}
+
 fn put_line(out: &mut Vec<u8>, disk: u64, head: Head, version: u32, flag: u8) {
     out.extend_from_slice(&disk.to_le_bytes());
     out.extend_from_slice(&head.restart.to_le_bytes());
@@ -731,7 +737,7 @@ fn put_body(out: &mut Vec<u8>, disk: u64, b: &Body) {
         b.fill_rate,
         b.holds,
         b.debt,
-        b.members,
+        b.epoch,
         b.floor.epoch,
         b.domains,
     ] {
@@ -742,10 +748,14 @@ fn put_body(out: &mut Vec<u8>, disk: u64, b: &Body) {
     out.extend_from_slice(&[
         b.count,
         b.floor.value,
-        u8::from(b.quiet) | u8::from(b.reconciled) << 1,
+        u8::from(b.quiet)
+            | u8::from(b.reconciled) << 1
+            | u8::from(b.drained) << 2
+            | u8::from(b.can_found) << 3,
         b.signals,
     ]);
     out.extend_from_slice(&b.remaining.to_le_bytes());
+    out.extend_from_slice(&b.era.to_le_bytes());
     let trips = trip_peers(disk, &b.round_trips);
     out.extend_from_slice(&(trips.len() as u16).to_le_bytes());
     for (peer, micros) in trips {
@@ -933,7 +943,7 @@ mod tests {
         let mut q = View::new(2, 1, body(2), 0, 0);
         q.merge(&p.answer(&q.digest()), 0, 0);
         assert!(p.answer(&q.digest()).iter().all(|u| u.disk != 1));
-        p.tick(HEARTBEAT_MS, HEARTBEAT_MS);
+        p.tick(HEARTBEAT_MS, HEARTBEAT_MS, &[]);
         let updates: Vec<Update> = p
             .answer(&q.digest())
             .into_iter()
@@ -952,7 +962,7 @@ mod tests {
         for step in 1..=600u64 {
             let now = step * 100;
             view.set_body(body(1 + step), now, now);
-            view.tick(now, now);
+            view.tick(now, now, &[]);
             let version = view.own().body_key.1;
             if version != last.0 {
                 assert!(
@@ -1021,7 +1031,7 @@ mod tests {
         for step in 1..=FAIL_MS / 500 {
             let now = step * 500;
             beat(&mut view, &[2], step + 1, now, now);
-            view.tick(now, now);
+            view.tick(now, now, &[]);
         }
         assert!(!view.absent(2));
         assert!(view.absent(3));
@@ -1031,7 +1041,7 @@ mod tests {
     #[test]
     fn a_flap_inside_the_join_window_is_no_loss() {
         let mut view = view(1, &[2], 0, 0);
-        view.tick(FAIL_MS, FAIL_MS);
+        view.tick(FAIL_MS, FAIL_MS, &[]);
         assert_eq!(view.losses(0), 1);
         let mut alive = view.entry(2).expect("member").head;
         alive.state = State::Alive;
@@ -1072,12 +1082,10 @@ mod tests {
         let mut y = view(2, &[1, 9], 0, 0);
         mark(&mut x, 9, State::Dead, 0, 0);
         mark(&mut y, 9, State::Dead, 0, 1_000);
-        x.tick(0, TOMBSTONE_HORIZON);
+        x.tick(0, TOMBSTONE_HORIZON, &[]);
         assert!(x.entry(9).is_none());
-        let before = x.member_set(&BTreeSet::new());
         x.merge(&y.answer(&x.digest()), 0, TOMBSTONE_HORIZON);
         assert!(x.entry(9).is_none());
-        assert_eq!(x.member_set(&BTreeSet::new()), before);
     }
 
     #[test]
@@ -1097,7 +1105,7 @@ mod tests {
     #[test]
     fn a_flap_of_a_later_absence_keeps_the_loss_of_an_earlier_one() {
         let mut view = view(1, &[2], 0, 0);
-        view.tick(FAIL_MS, FAIL_MS);
+        view.tick(FAIL_MS, FAIL_MS, &[]);
         mark(
             &mut view,
             2,
@@ -1106,7 +1114,7 @@ mod tests {
             FAIL_MS + JOIN_MS + 1,
         );
         assert_eq!(view.losses(0), 1);
-        view.tick(2 * FAIL_MS + 1, 5 * 3_600_000);
+        view.tick(2 * FAIL_MS + 1, 5 * 3_600_000, &[]);
         assert!(view.absent(2));
         mark(
             &mut view,
@@ -1123,7 +1131,7 @@ mod tests {
     fn a_second_absence_in_one_run_restarts_the_quiet_period() {
         let hour = 3_600_000;
         let mut view = view(1, &[2], 0, 0);
-        view.tick(FAIL_MS, FAIL_MS);
+        view.tick(FAIL_MS, FAIL_MS, &[]);
         mark(
             &mut view,
             2,
@@ -1131,7 +1139,7 @@ mod tests {
             FAIL_MS + 1,
             FAIL_MS + JOIN_MS + 1,
         );
-        view.tick(2 * FAIL_MS + 1, 5 * hour);
+        view.tick(2 * FAIL_MS + 1, 5 * hour, &[]);
         assert!(view.absent(2));
         assert_eq!(view.losses(0), 1);
         assert!(!view.quiet(6 * hour + 4_000, 6 * hour));
@@ -1163,7 +1171,7 @@ mod tests {
                 })
                 .collect();
             view.merge(&signalled, now, run);
-            view.tick(now + FAIL_MS, run + FAIL_MS);
+            view.tick(now + FAIL_MS, run + FAIL_MS, &[]);
             assert!(view.absent(2) && view.absent(3));
         }
         assert_eq!(view.losses(0), 4);
@@ -1174,15 +1182,14 @@ mod tests {
     fn a_drained_disk_that_comes_back_counts_its_next_death() {
         let hour = 3_600_000;
         let mut view = view(1, &[9], 0, 0);
-        view.drained(9);
-        view.tick(FAIL_MS, FAIL_MS);
+        view.drained(9, 0, 0);
+        view.tick(FAIL_MS, FAIL_MS, &[]);
         assert!(view.absent(9));
         assert_eq!(view.losses(0), 0);
         view.merge(&[update(9, 2, 0, State::Alive, body(9))], FAIL_MS + 1, hour);
-        view.tick(2 * FAIL_MS + 1, hour + 1);
+        view.tick(2 * FAIL_MS + 1, hour + 1, &[]);
         assert!(view.absent(9));
         assert_eq!(view.losses(0), 1);
-        assert_eq!(view.member_set(&BTreeSet::new()), 2);
     }
 
     fn holder(signals: u8, remaining: u32) -> Body {
@@ -1207,22 +1214,22 @@ mod tests {
             0,
         );
         y.merge(&[update(10, 1, 1, State::Left, holder(0, 3))], 0, 0);
-        y.tick(FAIL_MS, FAIL_MS);
+        y.tick(FAIL_MS, FAIL_MS, &[]);
         assert!(y.absent(9) && y.absent(10));
         let mut x = view(3, &[], 0, run);
         x.merge(&y.answer(&x.digest()), 0, run);
         assert!(x.absent(9) && x.absent(10));
         assert_eq!(x.losses(0), 0);
-        x.tick(0, run + STOP_BUDGET_MS + JOIN_MS);
+        x.tick(0, run + STOP_BUDGET_MS + JOIN_MS, &[]);
         assert_eq!(x.losses(0), 0);
         x.merge(&[update(10, 2, 1, State::Dead, holder(0, 0))], 0, run + 1);
         assert_eq!(x.losses(0), 0);
     }
 
     #[test]
-    fn a_member_first_seen_absent_replaces_nothing_when_it_returns() {
+    fn a_member_first_seen_absent_and_back_on_a_new_run_adds_no_loss() {
         let mut x = view(1, &[5], 0, 0);
-        x.tick(FAIL_MS, 10_000);
+        x.tick(FAIL_MS, 10_000, &[]);
         assert!(x.absent(5));
         x.merge(
             &[update(9, 1, 1, State::Dead, body(9))],
@@ -1235,7 +1242,7 @@ mod tests {
             30_000,
         );
         assert!(!x.absent(9));
-        assert_eq!(x.member_set(&BTreeSet::new()), 3);
+        assert_eq!(x.losses(0), 1);
     }
 
     #[test]
@@ -1244,7 +1251,7 @@ mod tests {
         let mut y = view(2, &[1, 9], 0, 0);
         mark(&mut x, 9, State::Dead, 0, 0);
         mark(&mut y, 9, State::Dead, 0, 1_000);
-        x.tick(0, TOMBSTONE_HORIZON);
+        x.tick(0, TOMBSTONE_HORIZON, &[]);
         assert!(x.entry(9).is_none());
         let run = TOMBSTONE_HORIZON + 1;
         let (mut x, _) =
@@ -1254,30 +1261,28 @@ mod tests {
     }
 
     #[test]
-    fn a_restarted_node_keeps_its_member_set() {
+    fn a_restarted_node_keeps_its_member_state() {
         let hour = 3_600_000;
         let mut x = view(1, &[2, 3, 4, 5], 0, 0);
         beat(&mut x, &[2], 2, FAIL_MS, 10_000);
-        x.tick(FAIL_MS, 10_000);
-        assert_eq!(x.member_set(&BTreeSet::new()), 5);
+        x.tick(FAIL_MS, 10_000, &[]);
         let state = x.durable(0);
         let (mut x, _) = View::restored(1, 2, body(1), 0, hour, &state).expect("the state decodes");
-        assert_eq!(x.member_set(&BTreeSet::new()), 5);
+        assert!(x.absent(3) && x.absent(4) && x.absent(5));
         beat(&mut x, &[2], 3, FAIL_MS, hour + FAIL_MS);
-        x.tick(FAIL_MS, hour + FAIL_MS);
+        x.tick(FAIL_MS, hour + FAIL_MS, &[]);
         assert!(!x.absent(2) && x.absent(3));
-        assert_eq!(x.member_set(&BTreeSet::new()), 5);
         assert_eq!(x.losses(0), 3);
         assert!(View::restored(1, 2, body(1), 0, hour, &state[..state.len() - 1]).is_none());
         let mut bad = state.clone();
-        bad[4 + 40] |= 0x30;
+        bad[4 + 40] |= 0x40;
         assert!(View::restored(1, 2, body(1), 0, hour, &bad).is_none());
     }
 
     #[test]
     fn a_state_with_an_absent_member_and_no_absent_time_or_a_disk_twice_does_not_decode() {
         let mut x = view(1, &[2, 3], 0, 0);
-        x.tick(FAIL_MS, FAIL_MS);
+        x.tick(FAIL_MS, FAIL_MS, &[]);
         let state = x.durable(0);
         assert!(View::restored(1, 2, body(1), 0, FAIL_MS, &state).is_some());
         let mut no_time = state.clone();
@@ -1291,10 +1296,32 @@ mod tests {
     #[test]
     fn a_drained_disk_is_forgotten_with_its_entry() {
         let mut view = view(1, &[9], 0, 0);
-        view.drained(9);
-        view.tick(FAIL_MS, FAIL_MS);
-        view.tick(FAIL_MS, FAIL_MS + TOMBSTONE_HORIZON);
+        view.drained(9, 0, 0);
+        view.tick(FAIL_MS, FAIL_MS, &[]);
+        view.tick(FAIL_MS, FAIL_MS + TOMBSTONE_HORIZON, &[]);
         assert!(view.entry(9).is_none());
-        assert!(view.drained.is_empty());
+        assert!(!view.is_drained(9));
+        let stale = Body {
+            drained: true,
+            ..body(9)
+        };
+        view.merge(
+            &[update(9, 1, 9, State::Left, stale)],
+            0,
+            FAIL_MS + TOMBSTONE_HORIZON + 1,
+        );
+        assert!(view.entry(9).is_none());
+    }
+
+    #[test]
+    fn a_list_member_stays_in_the_view_past_the_horizon() {
+        let mut x = view(1, &[2, 3], 0, 0);
+        x.tick(FAIL_MS, 1_000, &[]);
+        assert!(x.absent(2) && x.absent(3));
+        x.tick(FAIL_MS, 1_000 + TOMBSTONE_HORIZON, &[1, 2]);
+        assert!(x.entry(2).is_some());
+        assert!(x.entry(3).is_none());
+        x.tick(FAIL_MS, 1_000 + TOMBSTONE_HORIZON, &[1]);
+        assert!(x.entry(2).is_none());
     }
 }
