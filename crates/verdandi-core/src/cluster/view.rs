@@ -650,7 +650,7 @@ impl View {
     }
 }
 
-fn take<const N: usize>(rest: &mut &[u8]) -> Option<[u8; N]> {
+pub fn take<const N: usize>(rest: &mut &[u8]) -> Option<[u8; N]> {
     let (bytes, tail) = rest.split_first_chunk::<N>()?;
     *rest = tail;
     Some(*bytes)

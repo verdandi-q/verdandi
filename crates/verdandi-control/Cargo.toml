@@ -1,0 +1,11 @@
+[package]
+name = "verdandi-control"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish.workspace = true
+
+[dependencies]
+verdandi-core = { path = "../verdandi-core" }
+raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }
+slog = "2"

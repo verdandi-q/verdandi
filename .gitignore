@@ -3,3 +3,4 @@ target/
 tools/.heavy.lock
 tools/.last-heavy
 .idea/
+.context-guardian

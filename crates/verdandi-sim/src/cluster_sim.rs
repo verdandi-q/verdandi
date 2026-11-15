@@ -5,12 +5,11 @@ use std::hash::{DefaultHasher, Hash, Hasher};
 use rand::seq::{IndexedRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use raft::eraftpb::{ConfChangeType, Message};
+use verdandi_control::{Control, Meta, Saved};
 use verdandi_core::cluster::controller::{self, Controller, Floor, QUIET_PERIOD, START, refuse};
 use verdandi_core::cluster::domains::{self, Domains};
 use verdandi_core::cluster::fence::{self, Answer, Block, FENCE_MS, Fate, Known, Marks, confirmed};
-use verdandi_core::cluster::members::{
-    self, Ballot, Change, Durable, Fetches, Key, Members, Proposal, REPLICATE_MS, Reply,
-};
 use verdandi_core::cluster::placement::{self, Candidate, Groups, HolderSet};
 use verdandi_core::cluster::repair::{self, DIGEST_MS, Held, Limiter, Step, Want};
 use verdandi_core::cluster::steer::{self, Hold};
@@ -24,7 +23,9 @@ pub const SEGMENT_BYTES: u64 = 64 << 20;
 pub const HOUR_MS: u64 = 3_600_000;
 const FANOUT: usize = 3;
 const HELLO_MS: u64 = 10_000;
-const LONE_HELLO_MS: u64 = 1_000;
+const REPLICATE_MS: u64 = 5_000;
+const FOUNDING_STEPS: u64 = 600;
+const HEARD_MS: u64 = 10 * STEP_MS;
 const FLAP_MS: u64 = 13_500;
 const SLACK_MS: u64 = FAIL_MS + 2 * SAMPLE_MS + GOSSIP_MS;
 const STREAMS: u64 = 3;
@@ -102,17 +103,11 @@ pub struct CountChange {
 
 #[derive(Clone, Debug)]
 enum Msg {
-    Gossip(Vec<Update>, Vec<(u64, u64)>),
+    Gossip(Vec<Update>),
     Ping(Head),
     Pong(u64, Head),
-    Prepare(Key, Ballot),
-    Accept(Key, Ballot, Members),
-    Answer(Reply),
-    Commit(Members),
-    Adopted(Key),
-    Fetch,
-    List(Members),
-    Join(BTreeSet<u64>),
+    Raft(Message),
+    Lose(u64),
     Pick(u64, u64, u64),
     Picked(u64, Option<u64>, u64, u64, u64),
     Inputs(u64, u64, u64),
@@ -127,9 +122,9 @@ enum Msg {
     Dropped(u64),
     FenceAsk(u64, BTreeSet<u64>, u64),
     FenceIs(u64, u64, BTreeSet<u64>, Marks, bool, BTreeSet<u64>),
-    Confirm(u64, u64, u64, Key),
+    Confirm(u64, u64, u64, u64),
     VoteAsk(u64),
-    Vote(BTreeSet<u64>, BTreeSet<(u64, u64)>, u64),
+    Vote(BTreeSet<u64>, u64),
     MarksAsk,
     MarksIs(Marks, Marks, BTreeSet<(u64, u64)>),
     RecordsAsk(Marks, Option<(u64, u64)>),
@@ -149,7 +144,7 @@ struct Request {
     started_ms: u64,
     scope: BTreeSet<u64>,
     confirmed: BTreeSet<u64>,
-    newest: Key,
+    newest: u64,
 }
 
 struct Settle {
@@ -168,17 +163,15 @@ struct Frame {
     sent: u64,
     from: u64,
     to: u64,
-    genesis: u64,
-    key: Key,
-    hash: u64,
+    version: u64,
     msg: Msg,
 }
 
-type Vote = (BTreeSet<u64>, BTreeSet<(u64, u64)>, u64);
+type Vote = (BTreeSet<u64>, u64);
 type Answered = (Option<u64>, u64, u64, u64);
 type Inputs = (u64, u64, BTreeMap<u64, u64>);
 type Same = (u64, BTreeMap<u64, u64>, u64, u64);
-type PeerMarks = (Marks, Marks, u64, Key, u64, BTreeSet<(u64, u64)>);
+type PeerMarks = (Marks, Marks, u64, u64, BTreeSet<(u64, u64)>);
 type FenceAnswer = (BTreeSet<u64>, Marks, u64, BTreeSet<u64>);
 type SegAnswer = (Known, Marks, u64);
 type Lift = (u64, Option<(u64, State)>, u64);
@@ -192,7 +185,7 @@ struct Disk {
     zone: String,
     join_ms: u64,
     member: Option<Vec<u8>>,
-    state: Durable,
+    control: Saved,
     groups: Option<Groups>,
     records: BTreeMap<(u64, u64), (u64, u64, u64)>,
     marks: Marks,
@@ -200,11 +193,6 @@ struct Disk {
     sequence: u64,
     dropped: BTreeMap<u64, u64>,
     erased: BTreeSet<u64>,
-}
-
-struct Driver {
-    proposal: Proposal,
-    since_ms: u64,
 }
 
 struct Node {
@@ -225,20 +213,11 @@ struct Node {
     fences: BTreeMap<u64, BTreeSet<u64>>,
     unreachable: BTreeMap<u64, Option<u64>>,
     opened: Option<Floor>,
-    list: members::Node,
-    fetches: Fetches,
-    driver: Option<Driver>,
-    retry_ms: u64,
-    round: u32,
+    raft: Control,
+    heard_ms: Option<u64>,
     adopted_ms: u64,
+    lose: BTreeSet<u64>,
     booted_ms: u64,
-    waiting_ms: Option<u64>,
-    accepted_ms: Option<u64>,
-    joins: BTreeMap<u64, (BTreeSet<u64>, u64)>,
-    join_ms: Option<u64>,
-    signal_ms: BTreeMap<u64, u64>,
-    removed: BTreeMap<u64, (Key, u64)>,
-    adopted: BTreeSet<(u64, Key)>,
     picked: BTreeMap<(u64, u64), (Option<u64>, u64, u64)>,
     answered: BTreeMap<(u64, u64), Answered>,
     lease: BTreeMap<(u64, u64), (u64, u64)>,
@@ -325,6 +304,7 @@ pub struct World {
     pub missed_gossip: u64,
     pub resealed: u64,
     pub two_lists: u64,
+    pub raft_refused: u64,
     pub asks_doubled: u64,
     pub records_max: usize,
     pub record_frames: u64,
@@ -335,12 +315,8 @@ pub struct World {
     pub partial_reads: u64,
     pub incomplete_reads: u64,
     pub refused_settles: u64,
-    pub ballot_reuse: u64,
-    pub retries: u64,
-    pub resent: u64,
     pub groups_writes: Vec<(u64, u64, u64)>,
     pub commit_ms: u64,
-    pub committer: u64,
     pub stopped_at: BTreeMap<u64, u64>,
     pub removed_at: BTreeMap<u64, u64>,
     pub exits: BTreeMap<u64, u64>,
@@ -354,10 +330,8 @@ pub struct World {
     cut_ms: BTreeMap<(u64, u64), u64>,
     linked_ms: BTreeMap<(u64, u64), u64>,
     applied_ms: BTreeMap<(u64, u64), u64>,
-    lists: BTreeMap<(u64, Key), u64>,
-    newest: BTreeMap<u64, Members>,
-    ballots: BTreeMap<(u64, Key, Ballot), u64>,
-    started: BTreeSet<(u64, Key, Ballot)>,
+    terms: BTreeMap<u64, u64>,
+    applied_log: BTreeMap<u64, u64>,
     pub watch: bool,
     pub worst_stall: u64,
     stalled: BTreeMap<(u64, u64), Vec<u64>>,
@@ -453,6 +427,7 @@ impl World {
             missed_gossip: 0,
             resealed: 0,
             two_lists: 0,
+            raft_refused: 0,
             asks_doubled: 0,
             records_max: 0,
             record_frames: 0,
@@ -463,12 +438,8 @@ impl World {
             partial_reads: 0,
             incomplete_reads: 0,
             refused_settles: 0,
-            ballot_reuse: 0,
-            retries: 0,
-            resent: 0,
             groups_writes: Vec::new(),
             commit_ms: 0,
-            committer: 0,
             stopped_at: BTreeMap::new(),
             removed_at: BTreeMap::new(),
             exits: BTreeMap::new(),
@@ -482,10 +453,8 @@ impl World {
             cut_ms: BTreeMap::new(),
             linked_ms: BTreeMap::new(),
             applied_ms: BTreeMap::new(),
-            lists: BTreeMap::new(),
-            newest: BTreeMap::new(),
-            ballots: BTreeMap::new(),
-            started: BTreeSet::new(),
+            terms: BTreeMap::new(),
+            applied_log: BTreeMap::new(),
             watch: false,
             worst_stall: 0,
             stalled: BTreeMap::new(),
@@ -532,41 +501,40 @@ impl World {
             .collect()
     }
 
-    pub fn list(&self, disk: u64) -> Option<&Members> {
-        self.nodes.get(&disk).map(|n| n.list.list())
+    pub fn meta(&self, disk: u64) -> Option<&Meta> {
+        self.nodes.get(&disk).map(|n| n.raft.meta())
     }
 
-    pub fn newest(&self) -> Option<&Members> {
-        self.newest.values().max_by_key(|l| l.key())
+    pub fn newest(&self) -> Option<&Meta> {
+        self.disks
+            .values()
+            .map(|d| &d.control)
+            .max_by_key(|c| c.applied)
+            .map(|c| &c.meta)
+    }
+
+    pub fn raft_leader(&self) -> Option<u64> {
+        self.nodes
+            .iter()
+            .filter(|(_, n)| n.raft.is_leader())
+            .max_by_key(|(_, n)| n.raft.term())
+            .map(|(d, _)| *d)
     }
 
     pub fn in_list(&self, disk: u64) -> bool {
-        self.newest().is_some_and(|l| l.has(disk))
+        self.newest().is_some_and(|m| m.members.contains(&disk))
     }
 
     pub fn acts(&self, disk: u64) -> bool {
         self.nodes.get(&disk).is_some_and(|n| !n.full)
     }
 
-    pub fn conflict(&self, disk: u64) -> bool {
-        self.nodes
-            .get(&disk)
-            .is_some_and(|n| n.list.durable().conflict().is_some())
-    }
-
-    pub fn lost_entries(&self, disk: u64) -> BTreeSet<u64> {
-        self.nodes
-            .get(&disk)
-            .map(|n| n.list.durable().lost().keys().copied().collect())
-            .unwrap_or_default()
+    pub fn adopted_ms(&self, disk: u64) -> Option<u64> {
+        self.nodes.get(&disk).map(|n| n.adopted_ms)
     }
 
     pub fn joined(&self, disk: u64) -> bool {
         self.nodes.get(&disk).is_some_and(|n| n.joined)
-    }
-
-    pub fn adopted_ms(&self, disk: u64) -> Option<u64> {
-        self.nodes.get(&disk).map(|n| n.adopted_ms)
     }
 
     pub fn missed_records(&self) -> usize {
@@ -584,41 +552,6 @@ impl World {
                     .count()
             })
             .sum()
-    }
-
-    pub fn pending(&self, disk: u64) -> bool {
-        self.nodes.get(&disk).is_some_and(|n| n.list.pending())
-    }
-
-    pub fn proposing(&self, disk: u64) -> bool {
-        self.nodes.get(&disk).is_some_and(|n| n.driver.is_some())
-    }
-
-    pub fn list_pick(&self, by: u64) -> Option<u64> {
-        let node = self.nodes.get(&by)?;
-        let list = node.list.list();
-        let live: BTreeSet<u64> = list
-            .members
-            .iter()
-            .copied()
-            .filter(|m| !node.view.absent(*m))
-            .collect();
-        members::pick(list, &live, &BTreeSet::new(), 0)
-    }
-
-    pub fn saved(&self, disk: u64) -> bool {
-        self.nodes
-            .get(&disk)
-            .is_some_and(|n| *n.list.durable() == self.disks[&disk].state)
-    }
-
-    pub fn genesis_count(&self) -> usize {
-        self.nodes
-            .values()
-            .map(|n| n.list.list().genesis)
-            .filter(|g| *g != 0)
-            .collect::<BTreeSet<u64>>()
-            .len()
     }
 
     pub fn reconciled(&self, disk: u64) -> bool {
@@ -646,15 +579,12 @@ impl World {
     }
 
     fn majority(&self, h: u64) -> bool {
-        let Some(node) = self.nodes.get(&h) else {
-            return false;
-        };
-        node.list.durable().conflict().is_none()
-            && self.newest.get(&node.list.list().genesis).is_some_and(|l| {
-                l.has(h)
+        self.nodes.contains_key(&h)
+            && self.newest().is_some_and(|m| {
+                m.members.contains(&h)
                     && confirmed(
-                        l.members.iter().filter(|m| self.link(h, **m)).count(),
-                        l.members.len(),
+                        m.members.iter().filter(|x| self.link(h, **x)).count(),
+                        m.members.len(),
                     )
             })
     }
@@ -754,7 +684,7 @@ impl World {
                 zone: zone.to_owned(),
                 join_ms: self.run_ms,
                 member: None,
-                state: members::Node::new(disk).durable().clone(),
+                control: Saved::default(),
                 groups: None,
                 records: BTreeMap::new(),
                 marks: Marks::new(),
@@ -781,15 +711,23 @@ impl World {
                 self.create(zone, alive_ms, 1)
             })
             .collect();
-        let list = Members {
-            genesis: ids.first().copied().unwrap_or(0),
-            epoch: 1,
-            members: ids.clone(),
-            ..Members::default()
-        };
-        if !ids.is_empty() {
-            for d in &ids {
-                self.adopt(*d, &list);
+        if let Some(first) = ids.first().copied() {
+            let found = Control::found(first).expect("the founding state restores");
+            let saved = found.save().expect("the founding state saves");
+            if let (Some(node), Some(disk)) = (self.nodes.get_mut(&first), self.disks.get_mut(&first)) {
+                node.raft = found;
+                disk.control = saved;
+            }
+            let all: BTreeSet<u64> = ids.iter().copied().collect();
+            for _ in 0..FOUNDING_STEPS {
+                if self.newest().is_some_and(|m| m.members == all) {
+                    break;
+                }
+                self.advance(STEP_MS);
+            }
+            for node in self.nodes.values_mut() {
+                node.reconciled = false;
+                node.reconcile_ms = None;
             }
         }
         ids
@@ -836,7 +774,7 @@ impl World {
         let (restart, floor, committed, run) = (d.restart, d.floor, d.committed, d.alive_ms);
         let member = d.member.clone();
         let groups = d.groups.clone();
-        let list = members::Node::restore(disk, d.state.clone()).expect("the saved list restores");
+        let raft = Control::restore(disk, d.control.clone()).expect("the saved control state restores");
         let body = self.body(disk, format_max);
         let phase_ms = self.rng.random_range(0..SAMPLE_MS / STEP_MS) * STEP_MS;
         let (view, count) = match member {
@@ -866,20 +804,11 @@ impl World {
                 fences: BTreeMap::new(),
                 unreachable: BTreeMap::new(),
                 opened: None,
-                list,
-                fetches: Fetches::default(),
-                driver: None,
-                retry_ms: 0,
-                round: 0,
+                raft,
+                heard_ms: None,
                 adopted_ms: self.now_ms,
+                lose: BTreeSet::new(),
                 booted_ms: self.now_ms,
-                waiting_ms: None,
-                accepted_ms: None,
-                joins: BTreeMap::new(),
-                join_ms: None,
-                signal_ms: BTreeMap::new(),
-                removed: BTreeMap::new(),
-                adopted: BTreeSet::new(),
                 picked: BTreeMap::new(),
                 answered: BTreeMap::new(),
                 lease: BTreeMap::new(),
@@ -935,7 +864,6 @@ impl World {
                     return false;
                 }
             }
-            self.listed_by(disk, peer);
             self.exchange(disk, peer);
         }
         let ids: Vec<u64> = self
@@ -960,16 +888,6 @@ impl World {
         }
         self.drained.remove(&disk);
         true
-    }
-
-    fn listed_by(&mut self, to: u64, from: u64) {
-        let (Some(a), Some(b)) = (self.nodes.get(&to), self.nodes.get(&from)) else {
-            return;
-        };
-        if a.list.list().genesis == 0 && b.list.list().genesis != 0 {
-            let list = b.list.list().clone();
-            self.adopt(to, &list);
-        }
     }
 
     fn record(&mut self, disk: u64, kind: LossKind) {
@@ -1143,24 +1061,16 @@ impl World {
     }
 
     pub fn accept_loss_from(&mut self, origin: u64, disk: u64) -> bool {
-        let run = self.run_of(origin);
         let Some(node) = self.nodes.get_mut(&origin) else {
             return false;
         };
-        let Some(restart) = node.view.entry(disk).map(|e| e.head.restart) else {
-            return !node.list.list().has(disk);
-        };
+        if node.view.entry(disk).is_none() {
+            return !node.raft.meta().members.contains(&disk);
+        }
         if !node.view.absent(disk) {
             return false;
         }
-        node.list.lose(disk, restart, run);
-        self.save(origin);
-        let reached: Vec<u64> = self
-            .running()
-            .into_iter()
-            .filter(|r| self.link(origin, *r))
-            .collect();
-        self.lower(Cause::AcceptLoss, reached);
+        node.lose.insert(disk);
         true
     }
 
@@ -1290,7 +1200,7 @@ impl World {
 
     pub fn publish_from(&mut self, writer: u64) -> Option<u64> {
         let node = &self.nodes[&writer];
-        if !node.joined || !node.list.list().has(writer) {
+        if !node.joined || !node.raft.meta().members.contains(&writer) {
             self.refused_writes += 1;
             return None;
         }
@@ -1363,10 +1273,9 @@ impl World {
         set: &HolderSet,
         seen: &Marks,
     ) -> Option<BTreeSet<u64>> {
-        let conflict = self.conflict(to);
         let seg = self.segments.get_mut(&id)?;
         let before = learn(seg, to, set, seen);
-        if !conflict && seg.sets.get(&to).is_some_and(|s| !s.holders.contains(&to)) {
+        if seg.sets.get(&to).is_some_and(|s| !s.holders.contains(&to)) {
             seg.marks.remove(&to);
         }
         before
@@ -1840,11 +1749,10 @@ impl World {
     }
 
     fn apply_drop(&mut self, h: u64, id: u64) -> bool {
-        if self.conflict(h)
-            || self
-                .disks
-                .get(&h)
-                .is_none_or(|d| d.dropped.contains_key(&id))
+        if self
+            .disks
+            .get(&h)
+            .is_none_or(|d| d.dropped.contains_key(&id))
         {
             return false;
         }
@@ -1881,9 +1789,9 @@ impl World {
         for (n, node) in self.nodes.iter_mut() {
             let dropped = &self.disks[n].dropped;
             node.drops.retain(|id, _| dropped.contains_key(id));
-            let list = node.list.list();
+            let members = &node.raft.meta().members;
             for targets in node.drops.values_mut() {
-                targets.retain(|t| list.has(*t));
+                targets.retain(|t| members.contains(t));
             }
             node.drops.retain(|_, targets| !targets.is_empty());
             let view = &node.view;
@@ -1956,7 +1864,7 @@ impl World {
 
     fn ring_of(&self, disk: u64) -> (Vec<u64>, BTreeMap<u64, u64>) {
         let node = &self.nodes[&disk];
-        let list = node.list.list();
+        let members = &node.raft.meta().members;
         let domain: BTreeMap<u64, u64> = node
             .domains
             .as_ref()
@@ -1969,7 +1877,7 @@ impl World {
                 e.body.signals == 0
                     && !e.body.drained
                     && (e.body.reconciled || e.head.restart > 1)
-                    && list.has(*d)
+                    && members.contains(d)
             })
             .map(|(d, e)| Candidate {
                 disk: d,
@@ -2402,7 +2310,8 @@ impl World {
         for disk in stopping {
             let node = &self.nodes[&disk];
             let done = node.stop_run_ms.is_some_and(|t| self.run_ms >= t)
-                || (self.drains(disk, node).is_empty() && !node.list.list().has(disk));
+                || (self.drains(disk, node).is_empty()
+                    && !node.raft.meta().members.contains(&disk));
             if done {
                 self.leave(disk);
             }
@@ -2592,23 +2501,21 @@ impl World {
     }
 
     pub fn listed(&self, disk: u64) -> bool {
-        let Some(node) = self.nodes.get(&disk) else {
-            return false;
-        };
-        self.newest.get(&node.list.list().genesis).is_some_and(|l| {
-            let linked = l
-                .members
-                .iter()
-                .filter(|m| {
-                    **m == disk
-                        || self
-                            .linked_ms
-                            .get(&pair(disk, **m))
-                            .is_some_and(|t| self.now_ms < t + FENCE_MS)
-                })
-                .count();
-            l.has(disk) && confirmed(linked, l.members.len())
-        })
+        self.nodes.contains_key(&disk)
+            && self.newest().is_some_and(|m| {
+                let linked = m
+                    .members
+                    .iter()
+                    .filter(|x| {
+                        **x == disk
+                            || self
+                                .linked_ms
+                                .get(&pair(disk, **x))
+                                .is_some_and(|t| self.now_ms < t + FENCE_MS)
+                    })
+                    .count();
+                m.members.contains(&disk) && confirmed(linked, m.members.len())
+            })
     }
 
     fn counts_ok(&self, side: &BTreeSet<u64>, count: u8) -> bool {
@@ -2749,8 +2656,13 @@ impl World {
         for disk in &running {
             let run = self.run_of(*disk);
             if let Some(node) = self.nodes.get_mut(disk) {
-                let list = node.list.list().members.clone();
+                let list: Vec<u64> = node.raft.meta().members.iter().copied().collect();
                 node.view.tick(now, run, &list);
+            }
+        }
+        for disk in &running {
+            if self.rng.random_range(0..4) != 0 {
+                self.drive(*disk, Control::tick);
             }
         }
         self.pings();
@@ -2774,9 +2686,7 @@ impl World {
         self.answer_requests();
         self.answer_settles();
         for disk in &running {
-            self.propose(*disk);
-            self.ask_join(*disk);
-            self.ask_votes(*disk);
+            self.govern(*disk);
         }
         if now.is_multiple_of(GOSSIP_MS) {
             for disk in &running {
@@ -2789,25 +2699,6 @@ impl World {
             order.shuffle(&mut self.rng);
             for disk in &order {
                 let peers: Vec<u64> = running.iter().copied().filter(|p| p != disk).collect();
-                if let Some(peer) = peers.choose(&mut self.rng).copied() {
-                    self.hello(*disk, peer);
-                }
-            }
-        }
-        if now.is_multiple_of(LONE_HELLO_MS) {
-            for disk in &running {
-                if self
-                    .nodes
-                    .get(disk)
-                    .is_none_or(|n| n.list.list().genesis != 0)
-                {
-                    continue;
-                }
-                let peers: Vec<u64> = running
-                    .iter()
-                    .copied()
-                    .filter(|p| p != disk && self.link(*disk, *p))
-                    .collect();
                 if let Some(peer) = peers.choose(&mut self.rng).copied() {
                     self.hello(*disk, peer);
                 }
@@ -2843,23 +2734,13 @@ impl World {
     }
 
     fn gossip_to(&mut self, from: u64, to: u64, at: u64, updates: Vec<Update>) {
-        let lost = self.nodes.get(&from).map_or_else(Vec::new, |n| {
-            n.list
-                .durable()
-                .lost()
-                .iter()
-                .map(|(d, (r, _))| (*d, *r))
-                .collect()
-        });
         self.queue.push(Frame {
             at,
             sent: self.now_ms,
             from,
             to,
-            genesis: 0,
-            key: (0, 0),
-            hash: 0,
-            msg: Msg::Gossip(updates, lost),
+            version: 0,
+            msg: Msg::Gossip(updates),
         });
     }
 
@@ -2872,9 +2753,8 @@ impl World {
         let Some(node) = self.nodes.get(&from) else {
             return;
         };
-        let list = node.list.list();
-        let (genesis, key, hash) = (list.genesis, list.key(), list.hash());
-        let slow = if matches!(msg, Msg::Commit(_) | Msg::Fetch | Msg::List(_)) {
+        let version = node.raft.meta().version;
+        let slow = if matches!(msg, Msg::Raft(_)) {
             self.slow_ms
         } else {
             0
@@ -2899,9 +2779,7 @@ impl World {
             sent: self.now_ms,
             from,
             to,
-            genesis,
-            key,
-            hash,
+            version,
             msg,
         });
     }
@@ -2911,7 +2789,7 @@ impl World {
             let node = &self.nodes[&a];
             let head = node.view.own().head;
             let mut targets: BTreeSet<u64> = node.view.digest().iter().map(|l| l.disk).collect();
-            targets.extend(node.list.list().members.iter().copied());
+            targets.extend(node.raft.meta().members.iter().copied());
             targets.remove(&a);
             for b in targets {
                 self.send(a, b, Msg::Ping(head));
@@ -2959,23 +2837,9 @@ impl World {
         let Some(node) = self.nodes.get_mut(&to) else {
             return;
         };
-        if let Msg::Gossip(updates, lost) = &f.msg {
+        if let Msg::Gossip(updates) = &f.msg {
             node.view.merge(updates, now, run);
-            for (d, r) in lost {
-                node.list.lose(*d, *r, run);
-            }
-            self.save(to);
             return;
-        }
-        node.list.saw(f.genesis, f.key, run);
-        let own = node.list.list();
-        let behind = f.genesis == own.genesis
-            && f.genesis != 0
-            && f.key > own.key()
-            && node.fetches.ask(f.key, now);
-        self.save(to);
-        if behind {
-            self.send(to, f.from, Msg::Fetch);
         }
         match f.msg {
             Msg::Gossip(..) => {}
@@ -2987,56 +2851,26 @@ impl World {
             Msg::Pong(sent, head) => {
                 self.beat(to, f.from, head);
                 if let Some(node) = self.nodes.get_mut(&to) {
-                    node.list.pong(f.from, f.genesis, f.key, f.hash, sent, now);
                     let trip = node.trips.entry(f.from).or_insert((head.restart, 0));
                     *trip = (trip.0.max(head.restart), trip.1.max(sent));
                 }
             }
-            Msg::Prepare(base, ballot) => {
-                let reply = self
-                    .nodes
-                    .get_mut(&to)
-                    .map(|n| n.list.prepare(base, ballot));
-                self.save(to);
-                if let Some(reply) = reply {
-                    self.send(to, f.from, Msg::Answer(reply));
-                }
-            }
-            Msg::Accept(base, ballot, value) => {
-                let Some(Node { list, view, .. }) = self.nodes.get_mut(&to) else {
+            Msg::Raft(message) => {
+                let Some(node) = self.nodes.get_mut(&to) else {
                     return;
                 };
-                let reply = list.accept(base, ballot, &value, |d| !view.absent(d), run);
-                let genesis = list.list().genesis;
-                if matches!(reply, Reply::Accepted(..)) {
-                    let hash = value.hash();
-                    if *self.ballots.entry((genesis, base, ballot)).or_insert(hash) != hash {
-                        self.ballot_reuse += 1;
-                    }
+                match node.raft.step(message) {
+                    Ok(()) | Err(raft::Error::StepPeerNotFound | raft::Error::ProposalDropped) => {}
+                    Err(e) => panic!("the control plane refused a step: {e}"),
                 }
-                self.save(to);
-                self.send(to, f.from, Msg::Answer(reply));
-            }
-            Msg::Answer(reply) => self.reply(to, f.from, reply),
-            Msg::Commit(list) => {
-                self.adopt(to, &list);
-                self.send(to, f.from, Msg::Adopted(list.key()));
-            }
-            Msg::Adopted(key) => {
-                if let Some(node) = self.nodes.get_mut(&to) {
-                    node.adopted.insert((f.from, key));
+                if node.raft.leader() == Some(f.from) {
+                    node.heard_ms = Some(now);
                 }
+                self.flush(to);
             }
-            Msg::Fetch => {
-                let list = self.nodes[&to].list.list().clone();
-                if list.genesis != 0 {
-                    self.send(to, f.from, Msg::List(list));
-                }
-            }
-            Msg::List(list) => self.adopt(to, &list),
-            Msg::Join(trips) => {
-                if let Some(node) = self.nodes.get_mut(&to) {
-                    node.joins.insert(f.from, (trips, now));
+            Msg::Lose(disk) => {
+                if let Some(node) = self.nodes.get_mut(&to).filter(|n| n.view.absent(disk)) {
+                    node.lose.insert(disk);
                 }
             }
             Msg::Pick(id, asker, sent) => {
@@ -3235,34 +3069,29 @@ impl World {
                     self.apply_drop(to, id);
                 }
             }
-            Msg::Confirm(id, origin, by, key) => {
+            Msg::Confirm(id, origin, by, version) => {
                 if to != origin {
-                    self.send(to, origin, Msg::Confirm(id, origin, by, key));
+                    self.send(to, origin, Msg::Confirm(id, origin, by, version));
                 } else if let Some(r) = self.requests.get_mut(&id) {
                     r.confirmed.insert(by);
-                    r.newest = r.newest.max(key);
+                    r.newest = r.newest.max(version);
                 }
             }
             Msg::VoteAsk(sent) => {
                 let node = &self.nodes[&to];
-                let list = node.list.list();
-                let absent = list
+                let absent = node
+                    .raft
+                    .meta()
                     .members
                     .iter()
                     .copied()
                     .filter(|m| node.view.absent(*m))
                     .collect();
-                let passed = list
-                    .removed
-                    .iter()
-                    .copied()
-                    .filter(|e| node.list.passes(e, run))
-                    .collect();
-                self.send(to, f.from, Msg::Vote(absent, passed, sent));
+                self.send(to, f.from, Msg::Vote(absent, sent));
             }
-            Msg::Vote(absent, passed, sent) => {
+            Msg::Vote(absent, sent) => {
                 if let Some(node) = self.nodes.get_mut(&to) {
-                    node.votes.insert(f.from, (absent, passed, sent));
+                    node.votes.insert(f.from, (absent, sent));
                 }
             }
             Msg::MarksAsk => {
@@ -3274,7 +3103,7 @@ impl World {
             Msg::MarksIs(marks, forgot, reported) => {
                 if let Some(node) = self.nodes.get_mut(&to) {
                     node.peers
-                        .insert(f.from, (marks, forgot, f.genesis, f.key, now, reported));
+                        .insert(f.from, (marks, forgot, f.version, now, reported));
                 }
             }
             Msg::RecordsAsk(marks, after) => {
@@ -3358,14 +3187,14 @@ impl World {
         } else {
             Vec::new()
         };
-        let key = node.list.list().key();
+        let version = node.raft.meta().version;
         match &rec {
             Rec::Delete(k, stream, upto) => self.apply(to, *k, *stream, *upto),
             Rec::Groups(g) if to != origin => self.give(to, Some(g.clone())),
             Rec::Groups(_) => {}
         }
         if to != origin {
-            self.send(to, from, Msg::Confirm(id, origin, to, key));
+            self.send(to, from, Msg::Confirm(id, origin, to, version));
         }
         for p in peers {
             self.send(to, p, Msg::Record(id, origin, rec.clone(), cut.clone()));
@@ -3377,14 +3206,8 @@ impl World {
         self.next_request += 1;
         let now = self.now_ms;
         let node = &self.nodes[&origin];
-        let list = node.list.list();
-        let mut scope: BTreeSet<u64> = list.members.iter().copied().collect();
-        scope.extend(
-            node.removed
-                .iter()
-                .filter(|(d, (key, at))| now < at + FAIL_MS && !node.adopted.contains(&(**d, *key)))
-                .map(|(d, _)| *d),
-        );
+        let meta = node.raft.meta();
+        let mut scope: BTreeSet<u64> = meta.members.clone();
         scope.remove(&origin);
         let cut: BTreeSet<u64> = node
             .unreachable
@@ -3392,7 +3215,7 @@ impl World {
             .copied()
             .filter(|p| scope.contains(p))
             .collect();
-        let newest = list.key();
+        let newest = meta.version;
         self.requests.insert(
             id,
             Request {
@@ -3423,20 +3246,20 @@ impl World {
                 self.requests.remove(&id);
                 continue;
             }
-            let list = node.list.list();
-            if r.newest > list.key() {
+            let meta = node.raft.meta();
+            if r.newest > meta.version {
                 continue;
             }
-            let fresh = |v: &Vote| v.2 >= r.started_ms;
+            let fresh = |v: &Vote| v.1 >= r.started_ms;
             let open: Vec<u64> = r
                 .scope
                 .iter()
-                .chain(list.members.iter())
+                .chain(meta.members.iter())
                 .copied()
                 .filter(|p| *p != origin && !r.confirmed.contains(p))
                 .collect();
             let settled = open.iter().all(|p| {
-                let yes = list
+                let yes = meta
                     .members
                     .iter()
                     .filter(|v| {
@@ -3449,12 +3272,12 @@ impl World {
                         }
                     })
                     .count();
-                confirmed(yes, list.members.len())
+                confirmed(yes, meta.members.len())
             });
             if !settled {
                 let asked = node.vote_ms.is_some_and(|t| t >= r.started_ms);
                 if !asked && now >= r.started_ms + STEP_MS {
-                    let voters: Vec<u64> = list
+                    let voters: Vec<u64> = meta
                         .members
                         .iter()
                         .copied()
@@ -3572,8 +3395,8 @@ impl World {
             node.sent_inputs
                 .retain(|(_, sent), _| now < sent + 2 * FENCE_MS);
             node.fence_answers.retain(|_, a| now < a.2 + FENCE_MS);
-            node.votes.retain(|_, v| now < v.2 + REPLICATE_MS);
-            node.peers.retain(|_, p| now < p.4 + 2 * GOSSIP_MS);
+            node.votes.retain(|_, v| now < v.1 + REPLICATE_MS);
+            node.peers.retain(|_, p| now < p.3 + 2 * GOSSIP_MS);
             node.records_asked.retain(|_, t| now < *t + 2 * GOSSIP_MS);
             let start = node.reconcile_ms;
             node.seg_answers
@@ -3581,14 +3404,7 @@ impl World {
             node.seg_asked.retain(|_, t| now < *t + STEP_MS);
             node.copies
                 .retain(|(id, _), _| segments.get(id).is_some_and(|s| s.sets.contains_key(n)));
-            node.joins.retain(|_, j| now < j.1 + 2 * REPLICATE_MS);
             node.seen_records.retain(|_, t| now < *t + REPLICATE_MS);
-            let removed = &node.removed;
-            node.adopted.retain(|(d, k)| {
-                removed
-                    .get(d)
-                    .is_some_and(|(key, at)| key == k && now < at + FAIL_MS)
-            });
         }
     }
 
@@ -3611,8 +3427,6 @@ impl World {
             n.picked.len()
                 + n.votes.len()
                 + n.peers.len()
-                + n.joins.len()
-                + n.adopted.len()
                 + n.seen_records.len()
         })
     }
@@ -3621,7 +3435,7 @@ impl World {
         let now = self.now_ms;
         let mut asks = Vec::new();
         for (n, node) in &self.nodes {
-            let list = node.list.list();
+            let list = node.raft.meta();
             let ids: Vec<u64> = self
                 .segments
                 .iter()
@@ -3660,372 +3474,151 @@ impl World {
         }
     }
 
-    fn ask_votes(&mut self, disk: u64) {
-        let now = self.now_ms;
-        let run = self.run_of(disk);
-        let Some(node) = self.nodes.get(&disk) else {
-            return;
-        };
-        let list = node.list.list();
-        let needed = (list.credits > 0 && list.members.iter().any(|m| node.view.absent(*m)))
-            || node.list.drop_due(run).is_some();
-        if !needed || node.vote_ms.is_some_and(|t| now < t + REPLICATE_MS) {
-            return;
-        }
-        let voters: Vec<u64> = list
-            .members
-            .iter()
-            .copied()
-            .filter(|v| *v != disk && self.near(disk, *v))
-            .collect();
+    fn drive(&mut self, disk: u64, act: impl FnOnce(&mut Control)) {
         if let Some(node) = self.nodes.get_mut(&disk) {
-            node.vote_ms = Some(now);
+            act(&mut node.raft);
         }
-        for v in voters {
-            self.send(disk, v, Msg::VoteAsk(now));
-        }
+        self.flush(disk);
     }
 
-    fn reply(&mut self, disk: u64, from: u64, reply: Reply) {
-        let now = self.now_ms;
+    fn change(&mut self, disk: u64, kind: ConfChangeType, member: u64) {
         let Some(node) = self.nodes.get_mut(&disk) else {
             return;
         };
-        let Some(driver) = node.driver.as_mut() else {
-            return;
-        };
-        match driver.proposal.reply(from, reply) {
-            members::Step::Wait => {}
-            members::Step::CatchUp(_) => node.driver = None,
-            members::Step::Accept(value) => {
-                driver.since_ms = now;
-                let (base, ballot) = (driver.proposal.base.key(), driver.proposal.ballot);
-                for t in driver.proposal.acceptors() {
-                    self.send(disk, t, Msg::Accept(base, ballot, value.clone()));
-                }
-            }
-            members::Step::Commit(value) => {
-                node.driver = None;
-                self.committer = disk;
-                let drained = node.list.list().members.iter().any(|d| {
-                    !value.has(*d)
-                        && node
-                            .view
-                            .entry(*d)
-                            .is_some_and(|e| e.body.drained && e.body_key.0 == e.head.restart)
-                });
-                if drained {
-                    self.drain_commits.push((disk, self.run_ms));
-                    self.lower(Cause::Drain, vec![disk]);
-                }
-                let Some(node) = self.nodes.get_mut(&disk) else {
-                    return;
-                };
-                let live: Vec<u64> = node
-                    .view
-                    .live()
-                    .map(|(d, _)| d)
-                    .filter(|d| *d != disk)
-                    .collect();
-                self.adopt(disk, &value);
-                for t in live {
-                    self.send(disk, t, Msg::Commit(value.clone()));
-                }
-            }
-        }
+        self.raft_refused += u64::from(node.raft.propose_conf_change(kind, member).is_err());
+        self.flush(disk);
     }
 
-    fn save(&mut self, disk: u64) {
-        if let (Some(node), Some(d)) = (self.nodes.get(&disk), self.disks.get_mut(&disk)) {
-            d.state = node.list.durable().clone();
-        }
-    }
-
-    fn adopt(&mut self, disk: u64, list: &Members) {
-        let (now, run) = (self.now_ms, self.run_of(disk));
+    fn flush(&mut self, disk: u64) {
         let Some(node) = self.nodes.get_mut(&disk) else {
             return;
         };
-        let old = node.list.list().clone();
-        if let Some(reconcile) = node.list.adopt(list, run) {
-            node.reconciled &= !reconcile;
-            node.fetches.adopted(list.key());
-            node.adopted_ms = now;
-            node.driver = None;
-            node.waiting_ms = None;
-            node.new_member |= !old.has(disk) && list.has(disk);
-            for d in old.members.iter().filter(|d| !list.has(**d)) {
-                node.removed.insert(*d, (list.key(), now));
-            }
-            self.record_list(list);
-        }
-        self.save(disk);
-    }
-
-    fn record_list(&mut self, list: &Members) {
-        let hash = list.hash();
-        if *self.lists.entry((list.genesis, list.key())).or_insert(hash) != hash {
-            self.two_lists += 1;
-        }
-        let newest = self
-            .newest
-            .entry(list.genesis)
-            .or_insert_with(|| list.clone());
-        if list.key() > newest.key() {
-            for d in newest.members.iter().filter(|d| !list.has(**d)) {
-                self.removed_at.entry(*d).or_insert(self.now_ms);
-            }
-            *newest = list.clone();
-        }
-        self.commit_ms = self.now_ms;
-    }
-
-    fn requests(&self, disk: u64) -> Vec<Change> {
-        let node = &self.nodes[&disk];
-        let (view, list) = (&node.view, node.list.list());
-        let (now, run) = (self.now_ms, self.run_of(disk));
-        let restart_of = |d: u64| view.entry(d).map(|e| e.head.restart);
-        let lost = node.list.lost_members(restart_of);
-        let mut out = Vec::new();
-        for m in &list.members {
-            let Some(e) = view.entry(*m) else {
-                continue;
-            };
-            let current = e.body_key.0 == e.head.restart;
-            let stop = current && e.body.signals & STOPS != 0;
-            let drained = current && e.body.drained;
-            if view.absent(*m) {
-                if stop || drained {
-                    out.push(Change::AnnouncedStop(*m));
-                }
-                if view
-                    .absent_since(*m)
-                    .is_some_and(|t| run >= t + TOMBSTONE_HORIZON)
-                {
-                    out.push(Change::Horizon(*m));
-                }
-            } else if stop {
-                out.push(Change::SelfRemoval {
-                    seen_ms: node.signal_ms.get(m).copied().unwrap_or(run),
-                    disk: *m,
-                });
-            } else if drained && e.body.remaining == 0 {
-                out.push(Change::FinishedDrain(*m));
-            }
-        }
-        out.extend(lost.iter().map(|(d, r)| Change::AcceptLoss {
-            disk: *d,
-            restart: *r,
-        }));
-        for (j, (trips, at)) in &node.joins {
-            let Some(e) = view.entry(*j) else {
-                continue;
-            };
-            let current = e.body_key.0 == e.head.restart;
-            if now < at + 2 * REPLICATE_MS
-                && !view.absent(*j)
-                && !(current && (e.body.signals & STOPS != 0 || e.body.drained))
-                && !lost.contains_key(j)
-                && node.list.counts_join(*j, trips)
-            {
-                out.push(Change::Join {
-                    disk: *j,
-                    first_run: e.head.restart == 1,
-                });
-            }
-        }
-        let absent: BTreeMap<u64, u64> = list
-            .members
-            .iter()
-            .filter(|m| view.absent(**m))
-            .filter_map(|m| view.absent_since(*m).map(|t| (*m, t)))
-            .collect();
-        let votes: BTreeMap<u64, BTreeSet<u64>> = absent
-            .keys()
-            .map(|d| {
-                let mut yes: BTreeSet<u64> = node
-                    .votes
-                    .iter()
-                    .filter(|(v, vote)| {
-                        list.has(**v) && now < vote.2 + REPLICATE_MS && vote.0.contains(d)
-                    })
-                    .map(|(v, _)| *v)
-                    .collect();
-                yes.insert(disk);
-                (*d, yes)
-            })
-            .collect();
-        if let Some(d) = members::replacement(list, &absent, &votes) {
-            out.push(Change::Replacement(d));
-        }
-        if let Some(Change::Drop { disk: d, restart }) = node.list.drop_due(run) {
-            let mut yes: BTreeSet<u64> = node
-                .votes
-                .iter()
-                .filter(|(v, vote)| {
-                    list.has(**v) && now < vote.2 + REPLICATE_MS && vote.1.contains(&(d, restart))
-                })
-                .map(|(v, _)| *v)
-                .collect();
-            if node.list.passes(&(d, restart), run) {
-                yes.insert(disk);
-            }
-            if members::drop_agreed(list, &yes) {
-                out.push(Change::Drop { disk: d, restart });
-            }
-        }
-        out.sort();
-        out
-    }
-
-    fn propose(&mut self, disk: u64) {
-        let (now, run) = (self.now_ms, self.run_of(disk));
-        let Some(node) = self.nodes.get_mut(&disk) else {
+        let out = node.raft.drain().expect("the control plane drains");
+        let saved = node.raft.save().expect("the control plane saves");
+        let term = node.raft.is_leader().then(|| node.raft.term());
+        let Some(d) = self.disks.get_mut(&disk) else {
             return;
         };
-        let list = node.list.list().clone();
-        if !list.has(disk) || node.list.durable().conflict().is_some() {
-            return;
-        }
-        if let Some(driver) = &node.driver {
-            if now < driver.since_ms + REPLICATE_MS {
-                let p = &driver.proposal;
-                let (base, ballot) = (p.base.key(), p.ballot);
-                let msg = match p.value() {
-                    Some(value) => Msg::Accept(base, ballot, value.clone()),
-                    None => Msg::Prepare(base, ballot),
-                };
-                for t in p.unanswered() {
-                    self.resent += 1;
-                    self.send(disk, t, msg.clone());
-                }
-                return;
-            }
-            node.round = node.round.max(driver.proposal.seen);
-            node.driver = None;
-            node.retry_ms = now + self.rng.random_range(0..REPLICATE_MS);
-            self.retries += 1;
-            return;
-        }
-        if now < node.retry_ms {
-            return;
-        }
-        let node = &self.nodes[&disk];
-        let view = &node.view;
-        let reached: BTreeSet<u64> = list
-            .members
-            .iter()
-            .copied()
-            .filter(|m| *m == disk || self.near(disk, *m))
-            .collect();
-        let lost = node
-            .list
-            .lost_members(|d| view.entry(d).map(|e| e.head.restart));
-        if let Some(by) = node.list.forced(&reached, &lost, run) {
-            if by == disk {
-                self.begin(disk, |base, ballot| Proposal::forced(base, ballot, lost));
-            }
-            return;
-        }
-        let requests = self.requests(disk);
-        let node = &self.nodes[&disk];
-        let pending = node.list.pending();
-        if requests.is_empty() && !pending {
-            if let Some(node) = self.nodes.get_mut(&disk) {
-                node.waiting_ms = None;
-            }
-            return;
-        }
-        let view = &node.view;
-        let live: BTreeSet<u64> = list
-            .members
-            .iter()
-            .copied()
-            .filter(|m| !view.absent(*m))
-            .collect();
-        let signalled: BTreeSet<u64> = live
-            .iter()
-            .copied()
-            .filter(|m| view.entry(*m).is_some_and(|e| e.body.signals & STOPS != 0))
-            .collect();
-        let waited = now - node.waiting_ms.unwrap_or(now);
-        let pick = members::pick(&list, &live, &signalled, waited);
-        let quiet = now - node.accepted_ms.unwrap_or(now);
-        let own = requests
-            .iter()
-            .find_map(|c| node.list.change(*c, run))
-            .or_else(|| {
-                node.list
-                    .durable()
-                    .accepted()
-                    .as_ref()
-                    .map(|(_, v)| v.clone())
-            });
-        if let Some(node) = self.nodes.get_mut(&disk) {
-            node.waiting_ms.get_or_insert(now);
-        }
-        if !members::proposes(disk, pick, pending, quiet) {
-            return;
-        }
-        if let Some(own) = own {
-            self.begin(disk, |base, ballot| Proposal::new(base, ballot, own));
-        }
-    }
-
-    fn begin(&mut self, disk: u64, make: impl FnOnce(&Members, Ballot) -> Proposal) {
-        let now = self.now_ms;
-        let Some(node) = self.nodes.get_mut(&disk) else {
-            return;
-        };
-        let base = node.list.list().clone();
-        let Some(ballot) = node.list.ballot(node.round) else {
-            return;
-        };
-        self.save(disk);
-        let proposal = make(&base, ballot);
-        if !self.started.insert((base.genesis, base.key(), ballot)) {
-            self.ballot_reuse += 1;
-        }
-        let acceptors = proposal.acceptors();
-        if let Some(node) = self.nodes.get_mut(&disk) {
-            node.driver = Some(Driver {
-                proposal,
-                since_ms: now,
-            });
-        }
-        for a in acceptors {
-            self.send(disk, a, Msg::Prepare(base.key(), ballot));
-        }
-    }
-
-    fn ask_join(&mut self, disk: u64) {
-        let now = self.now_ms;
-        let Some(node) = self.nodes.get(&disk) else {
-            return;
-        };
-        let list = node.list.list();
-        let own = &node.view.own().body;
-        if list.genesis == 0
-            || list.has(disk)
-            || list.refuses(disk)
-            || node.list.durable().conflict().is_some()
-            || own.signals & STOPS != 0
-            || own.drained
-            || node.join_ms.is_some_and(|t| now < t + REPLICATE_MS)
+        let old = std::mem::replace(&mut d.control, saved);
+        self.applied(disk, &old);
+        if let Some(term) = term
+            && *self.terms.entry(term).or_insert(disk) != disk
         {
+            self.double_leaders += 1;
+        }
+        for message in out {
+            let to = message.to;
+            self.send(disk, to, Msg::Raft(message));
+        }
+    }
+
+    fn applied(&mut self, disk: u64, old: &Saved) {
+        let (now, run) = (self.now_ms, self.run_ms);
+        let control = &self.disks[&disk].control;
+        for entry in control.entries.iter().filter(|e| e.index > old.applied && e.index <= control.applied) {
+            let mut h = DefaultHasher::new();
+            (entry.term, entry.data.as_ref(), entry.context.as_ref()).hash(&mut h);
+            let hash = h.finish();
+            if *self.applied_log.entry(entry.index).or_insert(hash) != hash {
+                self.two_lists += 1;
+            }
+        }
+        if control.meta.version == old.meta.version {
             return;
         }
-        let trips: BTreeSet<u64> = list
+        self.commit_ms = now;
+        let gone: Vec<u64> = old
+            .meta
             .members
-            .iter()
+            .difference(&control.meta.members)
             .copied()
-            .filter(|m| self.near(disk, *m))
             .collect();
-        if let Some(node) = self.nodes.get_mut(&disk) {
-            node.join_ms = Some(now);
+        let joined = !old.meta.members.contains(&disk) && control.meta.members.contains(&disk);
+        for d in &gone {
+            self.removed_at.entry(*d).or_insert(now);
         }
-        for m in &trips {
-            self.send(disk, *m, Msg::Join(trips.clone()));
+        let Some(node) = self.nodes.get_mut(&disk) else {
+            return;
+        };
+        node.new_member |= joined;
+        node.adopted_ms = now;
+        if !node.raft.is_leader() {
+            return;
+        }
+        let lost: Vec<u64> = gone.iter().copied().filter(|d| node.lose.contains(d)).collect();
+        let drained = gone.iter().any(|d| {
+            node.view
+                .entry(*d)
+                .is_some_and(|e| e.body.drained && e.body_key.0 == e.head.restart)
+        });
+        if !lost.is_empty() {
+            let reached: Vec<u64> = self
+                .running()
+                .into_iter()
+                .filter(|r| self.link(disk, *r))
+                .collect();
+            self.lower(Cause::AcceptLoss, reached);
+        } else if drained {
+            self.drain_commits.push((disk, run));
+            self.lower(Cause::Drain, vec![disk]);
+        }
+    }
+
+    fn govern(&mut self, disk: u64) {
+        let Some(node) = self.nodes.get(&disk) else {
+            return;
+        };
+        let (view, meta, run) = (&node.view, node.raft.meta(), self.run_of(disk));
+        if !node.raft.is_leader() {
+            if let Some(leader) = node.raft.leader() {
+                let lose: Vec<u64> = node.lose.iter().copied().collect();
+                for d in lose {
+                    self.send(disk, leader, Msg::Lose(d));
+                }
+            }
+            return;
+        }
+        let flags = |d: u64| {
+            view.entry(d).map_or((false, false, 0), |e| {
+                let current = e.body_key.0 == e.head.restart;
+                (
+                    current && e.body.signals & STOPS != 0,
+                    current && e.body.drained,
+                    e.body.remaining,
+                )
+            })
+        };
+        let remove = meta.members.iter().copied().find(|m| {
+            let (stop, drained, remaining) = flags(*m);
+            if view.absent(*m) {
+                view.entry(*m).is_some()
+                    && (stop
+                        || drained
+                        || node.lose.contains(m)
+                        || view
+                            .absent_since(*m)
+                            .is_some_and(|t| run >= t + TOMBSTONE_HORIZON))
+            } else {
+                stop || drained && remaining == 0
+            }
+        });
+        let promote = node.raft.learners().iter().copied().find(|l| {
+            let (stop, drained, _) = flags(*l);
+            !view.absent(*l)
+                && !stop
+                && !drained
+                && view.entry(*l).is_some_and(|e| e.body.epoch == meta.version)
+        });
+        let add = view.live().map(|(d, _)| d).find(|d| {
+            let (stop, drained, _) = flags(*d);
+            !meta.members.contains(d) && !node.raft.learners().contains(d) && !stop && !drained
+        });
+        let change = remove
+            .map(|d| (ConfChangeType::RemoveNode, d))
+            .or(promote.map(|d| (ConfChangeType::AddNode, d)))
+            .or(add.map(|d| (ConfChangeType::AddLearnerNode, d)));
+        if let Some((kind, member)) = change {
+            self.change(disk, kind, member);
         }
     }
 
@@ -4057,14 +3650,9 @@ impl World {
 
     fn status(&self, disk: u64, body: &mut Body) {
         let node = &self.nodes[&disk];
-        let list = node.list.list();
         body.reconciled = node.reconciled;
         body.unreachable = node.unreachable.keys().copied().collect();
-        body.era = list.era;
-        body.epoch = list.epoch;
-        body.can_found = list.genesis == 0
-            && self.disks[&disk].records.is_empty()
-            && self.segments.values().all(|s| !s.marks.contains_key(&disk));
+        body.epoch = node.raft.meta().version;
         if body.drained {
             body.remaining = self.remaining(disk) as u32;
         }
@@ -4074,30 +3662,14 @@ impl World {
         let now = self.now_ms;
         let run = self.run_of(disk);
         self.expire(disk);
-        let Some(Node {
-            view,
-            list,
-            signal_ms,
-            ..
-        }) = self.nodes.get_mut(&disk)
-        else {
-            return;
-        };
-        list.expire(run);
-        for (d, e) in view.live() {
-            if e.body.signals & STOPS != 0 && e.body_key.0 == e.head.restart {
-                signal_ms.entry(d).or_insert(run);
-            }
-        }
-        let full = !list.acts(now);
         let Some(node) = self.nodes.get_mut(&disk) else {
             return;
         };
-        node.accepted_ms = node.list.pending().then(|| node.accepted_ms.unwrap_or(now));
-        if !node.list.keeps_reconciled(now)
-            || !node.list.list().has(disk)
-            || node.list.durable().conflict().is_some()
-        {
+        let members = &node.raft.meta().members;
+        let full = !(members.contains(&disk)
+            && (node.raft.is_leader() || node.heard_ms.is_some_and(|t| now < t + HEARD_MS)));
+        node.lose.retain(|d| members.contains(d));
+        if full {
             node.reconciled = false;
         }
         let node = &self.nodes[&disk];
@@ -4256,7 +3828,6 @@ impl World {
         {
             node.view.set_body(body, now, run);
         }
-        self.save(disk);
     }
 
     fn near(&self, by: u64, peer: u64) -> bool {
@@ -4275,7 +3846,7 @@ impl World {
 
     fn segment_fenced(&self, disk: u64, id: u64, lost: &mut BTreeSet<u64>) -> bool {
         let node = &self.nodes[&disk];
-        let (view, list) = (&node.view, node.list.list());
+        let (view, list) = (&node.view, node.raft.meta());
         let Some(set) = self.segments[&id].sets.get(&disk) else {
             return false;
         };
@@ -4327,12 +3898,12 @@ impl World {
                     .count();
                 !after(&disk) && !fence::quorum(fetched, holders)
             });
-            if alone && (missed || !others.is_empty()) && list.has(x) {
+            if alone && (missed || !others.is_empty()) && list.members.contains(&x) {
                 return false;
             }
             let members: Vec<Answer> = view
                 .live()
-                .filter(|(d, _)| alone && list.has(*d) && *d != disk && *d != x)
+                .filter(|(d, _)| alone && list.members.contains(d) && *d != disk && *d != x)
                 .filter_map(|(d, _)| answer(d, x))
                 .collect();
             let set = if alone { list.members.len() } else { 0 };
@@ -4405,12 +3976,12 @@ impl World {
         };
         let start = *node.reconcile_ms.get_or_insert(now);
         let node = &self.nodes[&disk];
-        let list = node.list.list();
+        let list = node.raft.meta();
         let members: Vec<u64> = node
             .view
             .live()
             .map(|(d, _)| d)
-            .filter(|d| *d != disk && list.has(*d))
+            .filter(|d| *d != disk && list.members.contains(d))
             .collect();
         let stale: Vec<u64> = members
             .iter()
@@ -4418,7 +3989,7 @@ impl World {
             .filter(|m| {
                 node.peers
                     .get(m)
-                    .is_none_or(|p| p.4 < start || now >= p.4 + GOSSIP_MS)
+                    .is_none_or(|p| p.3 < start || now >= p.3 + GOSSIP_MS)
             })
             .collect();
         for m in stale {
@@ -4462,9 +4033,9 @@ impl World {
             self.ask_seg(disk, id, c);
         }
         let node = &self.nodes[&disk];
-        let list = node.list.list();
+        let list = node.raft.meta();
         let fresh = |t: u64| t >= start && now < t + 2 * GOSSIP_MS;
-        let answer = |m: u64| node.peers.get(&m).filter(|p| fresh(p.4)).cloned();
+        let answer = |m: u64| node.peers.get(&m).filter(|p| fresh(p.3)).cloned();
         let own_pairs = self.reported(disk);
         let cut = |m: u64| {
             let votes = list
@@ -4474,7 +4045,7 @@ impl World {
                     let pairs = if **v == disk {
                         Some(&own_pairs)
                     } else {
-                        node.peers.get(v).filter(|p| fresh(p.4)).map(|p| &p.5)
+                        node.peers.get(v).filter(|p| fresh(p.3)).map(|p| &p.4)
                     };
                     pairs.is_some_and(|p| p.contains(&pair(disk, m)))
                 })
@@ -4493,7 +4064,7 @@ impl World {
             .collect();
         if answers
             .iter()
-            .any(|(_, a)| a.2 != list.genesis || (node.new_member && a.3 < list.key()))
+            .any(|(_, a)| node.new_member && a.2 < list.version)
         {
             return;
         }
@@ -4666,8 +4237,6 @@ impl World {
                 node.view.merge(&updates, now, run);
             }
         }
-        self.listed_by(from, to);
-        self.listed_by(to, from);
     }
 
     fn sample(&mut self, disk: u64) {
@@ -4723,10 +4292,11 @@ impl World {
             .live()
             .map(|(_, e)| e.body.floor)
             .fold(from, Floor::max);
-        let acts = !node.full;
-        node.ctl.decide(&node.view, node.list.list(), acts, run);
+        let acts = node.raft.is_leader();
+        let (members, version) = (&node.raft.meta().members, node.raft.meta().version);
+        node.ctl.decide(&node.view, members, version, acts, run);
         let to = node.ctl.floor;
-        let committed = node.ctl.commit(&node.view, node.list.list(), acts, run);
+        let committed = node.ctl.commit(&node.view, members, version, acts, run);
         let member = node.view.durable(node.ctl.count);
         let refused = refuse(committed, node.format_max);
         if before != count {

@@ -3,7 +3,6 @@ use std::ops::Bound;
 use std::path::Path;
 
 use verdandi_core::cluster::controller::{Controller, Floor, START};
-use verdandi_core::cluster::members::{Members, Node as MemberNode};
 use verdandi_core::cluster::placement::{Groups, HolderSet, next};
 use verdandi_core::lease::Settle;
 use verdandi_sim::fault_fs::FaultFs;
@@ -148,39 +147,4 @@ fn i12_groups_holder_sets_and_floors_merge_in_any_order() {
             assert_eq!(a.clone().merge(b.clone()), b.clone().merge(a.clone()));
         }
     }
-}
-
-#[test]
-fn i12_the_member_list_takes_only_a_higher_key_and_never_merges() {
-    let list = |epoch: u64, members: Vec<u64>| Members {
-        genesis: 1,
-        epoch,
-        members,
-        ..Members::default()
-    };
-    let lists = [
-        list(1, vec![1, 2, 3]),
-        list(2, vec![1, 2, 3, 4]),
-        list(3, vec![1, 2, 4]),
-    ];
-    let mut seed = 0x2545_f491_4f6c_dd1d;
-    for _ in 0..20 {
-        let mut node = MemberNode::new(1);
-        for l in shuffled(&lists, &mut seed) {
-            node.adopt(&l, 0);
-        }
-        assert_eq!(node.list(), &lists[2]);
-    }
-    let mut node = MemberNode::new(1);
-    assert_eq!(node.adopt(&lists[0], 0), Some(true));
-    let other = list(2, vec![1, 2, 3, 5]);
-    assert_eq!(node.adopt(&lists[1], 0), Some(false));
-    assert_eq!(node.adopt(&other, 0), None);
-    assert_eq!(node.list(), &lists[1]);
-    let foreign = Members {
-        genesis: 9,
-        ..list(3, vec![1, 9])
-    };
-    assert_eq!(node.adopt(&foreign, 0), None);
-    assert_eq!(node.list(), &lists[1]);
 }

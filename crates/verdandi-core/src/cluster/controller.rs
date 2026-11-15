@@ -1,5 +1,6 @@
+use std::collections::BTreeSet;
+
 use super::fence::confirmed;
-use super::members::Members;
 use super::view::{SAMPLE_MS, View};
 
 pub const QUIET_PERIOD: u64 = 6 * 3_600_000;
@@ -114,12 +115,12 @@ pub fn refuse(committed: u16, format_max: u16) -> bool {
     committed > format_max
 }
 
-fn at_epoch(view: &View, list: &Members) -> bool {
+fn at_epoch(view: &View, members: &BTreeSet<u64>, version: u64) -> bool {
     let voters = view
         .live()
-        .filter(|(disk, e)| list.has(*disk) && (e.body.era, e.body.epoch) == list.key())
+        .filter(|(disk, e)| members.contains(disk) && e.body.epoch == version)
         .count();
-    confirmed(voters, list.members.len())
+    confirmed(voters, members.len())
 }
 
 #[derive(Clone, Debug)]
@@ -188,7 +189,8 @@ impl Controller {
     pub fn decide(
         &mut self,
         view: &View,
-        list: &Members,
+        members: &BTreeSet<u64>,
+        version: u64,
         acts: bool,
         run_ms: u64,
     ) -> Option<Floor> {
@@ -208,7 +210,7 @@ impl Controller {
         let quiet = acts
             && peers.iter().all(|b| b.quiet && b.count == c && b.debt == 0)
             && c < self.floor.value
-            && at_epoch(view, list);
+            && at_epoch(view, members, version);
         let sample = (c, run_ms / SAMPLE_MS);
         match self.streak {
             _ if !quiet => self.streak = None,
@@ -236,7 +238,14 @@ impl Controller {
         })
     }
 
-    pub fn commit(&mut self, view: &View, list: &Members, acts: bool, run_ms: u64) -> u16 {
+    pub fn commit(
+        &mut self,
+        view: &View,
+        members: &BTreeSet<u64>,
+        version: u64,
+        acts: bool,
+        run_ms: u64,
+    ) -> u16 {
         let seen = view
             .live()
             .map(|(_, e)| e.body.committed)
@@ -249,7 +258,7 @@ impl Controller {
             view.entry(*disk).is_some_and(|e| e.body.format_max >= next)
                 && view.alive_for(*disk, run_ms) >= SOAK_MS
         });
-        if ready && acts && at_epoch(view, list) {
+        if ready && acts && at_epoch(view, members, version) {
             self.committed = next;
         }
         self.committed
@@ -544,17 +553,18 @@ mod tests {
         assert_eq!(ctl.floor, Floor { epoch: 1, value: 3 });
     }
 
-    fn list(members: impl IntoIterator<Item = u64>) -> Members {
-        Members {
-            genesis: 1,
-            members: members.into_iter().collect(),
-            ..Members::default()
-        }
+    fn list(members: impl IntoIterator<Item = u64>) -> BTreeSet<u64> {
+        members.into_iter().collect()
     }
 
-    fn decide(ctl: &mut Controller, view: &View, list: &Members, at: &mut u64) -> Option<Floor> {
+    fn decide(
+        ctl: &mut Controller,
+        view: &View,
+        list: &BTreeSet<u64>,
+        at: &mut u64,
+    ) -> Option<Floor> {
         *at += SAMPLE_MS;
-        ctl.decide(view, list, true, *at)
+        ctl.decide(view, list, 0, true, *at)
     }
 
     #[test]
@@ -563,14 +573,14 @@ mod tests {
         report(&mut view, &[1, 2, 3], 2, 0);
         let mut ctl = Controller::new(true, Floor { epoch: 0, value: 4 }, 1);
         ctl.count = 2;
-        assert_eq!(ctl.decide(&view, &list(1..=3), true, SAMPLE_MS), None);
-        assert_eq!(ctl.decide(&view, &list(1..=3), true, SAMPLE_MS + 1), None);
-        assert_eq!(ctl.decide(&view, &list(1..=3), true, 3 * SAMPLE_MS), None);
+        assert_eq!(ctl.decide(&view, &list(1..=3), 0, true, SAMPLE_MS), None);
+        assert_eq!(ctl.decide(&view, &list(1..=3), 0, true, SAMPLE_MS + 1), None);
+        assert_eq!(ctl.decide(&view, &list(1..=3), 0, true, 3 * SAMPLE_MS), None);
         ctl.count = 3;
         report(&mut view, &[1, 2, 3], 3, 0);
-        assert_eq!(ctl.decide(&view, &list(1..=3), true, 4 * SAMPLE_MS), None);
+        assert_eq!(ctl.decide(&view, &list(1..=3), 0, true, 4 * SAMPLE_MS), None);
         assert_eq!(
-            ctl.decide(&view, &list(1..=3), true, 5 * SAMPLE_MS),
+            ctl.decide(&view, &list(1..=3), 0, true, 5 * SAMPLE_MS),
             Some(Floor { epoch: 1, value: 3 })
         );
     }
@@ -750,22 +760,18 @@ mod tests {
     }
 
     #[test]
-    fn a_body_at_the_same_epoch_of_another_era_does_not_count() {
+    fn a_body_at_another_version_does_not_count() {
         let mut view = cluster(3, GB);
         report(&mut view, &[1, 2, 3], 2, 0);
         for m in 1..=3 {
             set(&mut view, m, 0, |b| b.epoch = 3);
         }
-        let list = Members {
-            era: 1,
-            epoch: 3,
-            ..list(1..=3)
-        };
         let mut ctl = Controller::new(true, Floor { epoch: 0, value: 3 }, 1);
         ctl.count = 2;
         let mut at = 0;
         for _ in 0..3 {
-            assert_eq!(decide(&mut ctl, &view, &list, &mut at), None);
+            at += SAMPLE_MS;
+            assert_eq!(ctl.decide(&view, &list(1..=3), 4, true, at), None);
         }
     }
 
@@ -779,11 +785,11 @@ mod tests {
         let mut ctl = Controller::new(true, Floor { epoch: 0, value: 3 }, 1);
         ctl.count = 2;
         for at in 1..=3 {
-            assert_eq!(ctl.decide(&view, &list(1..=3), false, at * SAMPLE_MS), None);
+            assert_eq!(ctl.decide(&view, &list(1..=3), 0, false, at * SAMPLE_MS), None);
         }
-        assert_eq!(ctl.commit(&view, &list(1..=3), false, SOAK_MS), 1);
-        assert_eq!(ctl.commit(&view, &list(1..=6), true, SOAK_MS), 1);
-        assert_eq!(ctl.commit(&view, &list(1..=3), true, SOAK_MS), 2);
+        assert_eq!(ctl.commit(&view, &list(1..=3), 0, false, SOAK_MS), 1);
+        assert_eq!(ctl.commit(&view, &list(1..=6), 0, true, SOAK_MS), 1);
+        assert_eq!(ctl.commit(&view, &list(1..=3), 0, true, SOAK_MS), 2);
         let mut at = 3 * SAMPLE_MS;
         assert_eq!(decide(&mut ctl, &view, &list(1..=3), &mut at), None);
         assert_eq!(
@@ -863,11 +869,11 @@ mod tests {
             set(&mut view, m, 0, |b| b.format_max = 2);
         }
         let mut ctl = Controller::new(true, START, 1);
-        assert_eq!(ctl.commit(&view, &list(1..=4), true, SOAK_MS - 1), 1);
+        assert_eq!(ctl.commit(&view, &list(1..=4), 0, true, SOAK_MS - 1), 1);
         set(&mut view, 4, 0, |b| b.format_max = 1);
-        assert_eq!(ctl.commit(&view, &list(1..=4), true, SOAK_MS), 1);
+        assert_eq!(ctl.commit(&view, &list(1..=4), 0, true, SOAK_MS), 1);
         set(&mut view, 4, 0, |b| b.format_max = 2);
-        assert_eq!(ctl.commit(&view, &list(1..=4), true, SOAK_MS), 2);
+        assert_eq!(ctl.commit(&view, &list(1..=4), 0, true, SOAK_MS), 2);
         assert!(refuse(2, 1));
         assert!(!refuse(2, 2));
     }

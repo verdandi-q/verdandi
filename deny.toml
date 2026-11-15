@@ -18,3 +18,9 @@ multiple-versions = "warn"
 [sources]
 unknown-registry = "deny"
 unknown-git = "deny"
+
+[advisories]
+ignore = [
+    { id = "RUSTSEC-2024-0437", reason = "protobuf 2 via raft 0.7; parses only frames from peers authenticated by the cluster key; see plans/hardening.md" },
+    { id = "RUSTSEC-2025-0057", reason = "fxhash via raft 0.7; unmaintained, no known flaw; see plans/hardening.md" },
+]
