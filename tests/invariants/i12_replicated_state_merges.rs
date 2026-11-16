@@ -2,7 +2,6 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Bound;
 use std::path::Path;
 
-use verdandi_core::cluster::controller::{Controller, Floor, START};
 use verdandi_core::cluster::placement::{Groups, HolderSet, next};
 use verdandi_core::lease::Settle;
 use verdandi_sim::fault_fs::FaultFs;
@@ -73,7 +72,7 @@ fn shuffled<T: Clone>(items: &[T], seed: &mut u64) -> Vec<T> {
 }
 
 #[test]
-fn i12_groups_holder_sets_and_floors_merge_in_any_order() {
+fn i12_groups_and_holder_sets_merge_in_any_order() {
     let mut records: Vec<Groups> = Vec::new();
     for size in 2..=4u8 {
         for n in 3..=8u64 {
@@ -99,12 +98,6 @@ fn i12_groups_holder_sets_and_floors_merge_in_any_order() {
             holders: (1..=3 + i % 3).map(|d| d + i).collect(),
         })
         .collect();
-    let floors: Vec<Floor> = (0..12u64)
-        .map(|i| Floor {
-            epoch: i % 3,
-            value: 2 + (i % 4) as u8,
-        })
-        .collect();
     let mut seed = 0x9e37_79b9_7f4a_7c15;
     let groups = records.iter().cloned().reduce(Groups::merge);
     let holders = sets.iter().cloned().reduce(HolderSet::merge);
@@ -112,7 +105,6 @@ fn i12_groups_holder_sets_and_floors_merge_in_any_order() {
         holders.as_ref().map(|h| h.epoch),
         sets.iter().map(|h| h.epoch).max()
     );
-    let floor = floors.iter().copied().max();
     for _ in 0..100 {
         assert_eq!(
             shuffled(&records, &mut seed)
@@ -126,11 +118,6 @@ fn i12_groups_holder_sets_and_floors_merge_in_any_order() {
                 .reduce(HolderSet::merge),
             holders
         );
-        let mut ctl = Controller::new(true, START, 1);
-        for f in shuffled(&floors, &mut seed) {
-            ctl.merge(f);
-        }
-        assert_eq!(Some(ctl.floor), floor);
     }
     for a in &sets {
         for b in sets.iter().filter(|b| b.epoch == a.epoch) {

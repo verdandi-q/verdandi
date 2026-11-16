@@ -9,7 +9,8 @@ use verdandi_sim::cluster_sim::{
 };
 
 const MIXES: u64 = 1_000;
-const STALL_MS: u64 = 15_000;
+const ELECTION_MS: u64 = 25_000;
+const STALL_MS: u64 = 15_000 + ELECTION_MS;
 const MIX_STALL_MS: u64 = STALL_MS + 2 * verdandi_core::cluster::fence::FENCE_MS;
 const EVENTS: usize = 20;
 const THREADS: usize = 4;
@@ -228,7 +229,7 @@ fn i16_a_joiner_after_a_rolling_restart_keeps_the_floor_on_a_minority_side() {
         }
         let joiner = w.create("a", OLD, 1);
         w.advance(30_000);
-        let minority = [joiner, nodes[0], nodes[1], nodes[2]];
+        let minority = [joiner, nodes[0]];
         w.part(&minority);
         w.quiet_hours(7);
         w.advance(60_000);
@@ -273,7 +274,7 @@ fn i16_the_oracle_records_a_loss_of_a_node_that_holds_bytes() {
     let mut w = World::new(1);
     let nodes = w.start(3, 3, OLD);
     w.fill(GB);
-    w.advance(10_000);
+    w.advance(20_000);
     w.kill(nodes[0]);
     assert_eq!(w.losses.len(), 1);
 }

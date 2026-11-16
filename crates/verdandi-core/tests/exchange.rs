@@ -1,4 +1,3 @@
-use verdandi_core::cluster::controller::Floor;
 use verdandi_core::cluster::view::{
     Body, Head, State, Update, View, encode_digest, encode_lost, encode_updates,
 };
@@ -29,7 +28,6 @@ fn full_body(disk: u64, members: &[u64], holds: u64) -> Body {
         count: 3,
         era: 1,
         epoch: 9,
-        floor: Floor { epoch: 1, value: 3 },
         domains: 42,
         quiet: true,
         reconciled: true,

@@ -1,6 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
 
-use super::controller::Floor;
 use super::fnv;
 
 pub const HEARTBEAT_MS: u64 = 500;
@@ -56,7 +55,6 @@ pub struct Body {
     pub count: u8,
     pub era: u32,
     pub epoch: u64,
-    pub floor: Floor,
     pub domains: u64,
     pub quiet: bool,
     pub reconciled: bool,
@@ -738,7 +736,6 @@ fn put_body(out: &mut Vec<u8>, disk: u64, b: &Body) {
         b.holds,
         b.debt,
         b.epoch,
-        b.floor.epoch,
         b.domains,
     ] {
         out.extend_from_slice(&n.to_le_bytes());
@@ -747,7 +744,6 @@ fn put_body(out: &mut Vec<u8>, disk: u64, b: &Body) {
     out.extend_from_slice(&b.committed.to_le_bytes());
     out.extend_from_slice(&[
         b.count,
-        b.floor.value,
         u8::from(b.quiet)
             | u8::from(b.reconciled) << 1
             | u8::from(b.drained) << 2
@@ -783,10 +779,6 @@ mod tests {
         Body {
             debt: n * 7,
             count: n as u8,
-            floor: Floor {
-                epoch: n,
-                value: (n % 5) as u8,
-            },
             quiet: n.is_multiple_of(2),
             reconciled: n.is_multiple_of(3),
             unreachable: (0..n % 4).collect(),

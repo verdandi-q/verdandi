@@ -1,12 +1,11 @@
-use std::cell::OnceCell;
 use std::collections::{BTreeMap, BTreeSet};
 use std::hash::{DefaultHasher, Hash, Hasher};
 
+use raft::eraftpb::{ConfChangeType, Message};
 use rand::seq::{IndexedRandom, SliceRandom};
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
-use raft::eraftpb::{ConfChangeType, Message};
-use verdandi_control::{Control, Meta, Saved};
+use verdandi_control::{Command, Control, Meta, Saved};
 use verdandi_core::cluster::controller::{self, Controller, Floor, QUIET_PERIOD, START, refuse};
 use verdandi_core::cluster::domains::{self, Domains};
 use verdandi_core::cluster::fence::{self, Answer, Block, FENCE_MS, Fate, Known, Marks, confirmed};
@@ -23,18 +22,18 @@ pub const SEGMENT_BYTES: u64 = 64 << 20;
 pub const HOUR_MS: u64 = 3_600_000;
 const FANOUT: usize = 3;
 const HELLO_MS: u64 = 10_000;
+const REPLACE_MS: u64 = 30_000;
 const REPLICATE_MS: u64 = 5_000;
 const FOUNDING_STEPS: u64 = 600;
 const HEARD_MS: u64 = 10 * STEP_MS;
+const LEASE_MS: u64 = 3_000;
 const FLAP_MS: u64 = 13_500;
 const SLACK_MS: u64 = FAIL_MS + 2 * SAMPLE_MS + GOSSIP_MS;
 const STREAMS: u64 = 3;
 const STALL_WINDOW_MS: u64 = 60_000;
 const STOPS: u8 = SIGTERM | LIFECYCLE;
-const PICKS_MAX: usize = 64;
 const RECORDS_MAX: usize = 64;
 const FENCES_MAX: usize = 64;
-const SETS_MAX: usize = 64;
 const SEG_ASKS_MAX: usize = 64;
 const DROPS_MAX: usize = 64;
 
@@ -108,16 +107,15 @@ enum Msg {
     Pong(u64, Head),
     Raft(Message),
     Lose(u64),
-    Pick(u64, u64, u64),
-    Picked(u64, Option<u64>, u64, u64, u64),
-    Inputs(u64, u64, u64),
-    InputsIs(Option<u64>, u64, u64, u64),
     Record(u64, u64, Rec, BTreeSet<u64>),
-    Ack(u64, u64, u64),
-    Acked(u64, bool),
-    Set(u64, HolderSet, Marks, bool),
-    SegAsk(u64),
-    Seg(u64, Option<HolderSet>, Marks, Option<u64>, Known),
+    Ack(u64, u64, u64, u64),
+    Acked(u64, bool, u64),
+    Wish(HolderSet),
+    SegAsk(u64, u64),
+    Seg(u64, Option<u64>, Known, u64),
+    Beat(u64, u64),
+    Copied(u64, u64, u64),
+    Beaten(u64, u64, u64),
     Drop(u64),
     Dropped(u64),
     FenceAsk(u64, BTreeSet<u64>, u64),
@@ -134,7 +132,10 @@ enum Msg {
 #[derive(Clone, Debug)]
 enum Rec {
     Delete((u64, u64), u64, u64),
-    Groups(Groups),
+}
+
+fn groups_of(node: &Node) -> Option<&Groups> {
+    Some(&node.raft.meta().groups).filter(|g| g.epoch > 0)
 }
 
 struct Request {
@@ -147,14 +148,23 @@ struct Request {
     newest: u64,
 }
 
+#[derive(Default)]
+struct Lease {
+    epoch: u64,
+    from: BTreeSet<u64>,
+    synced_ms: Option<u64>,
+    beats: BTreeMap<u64, u64>,
+}
+
 struct Settle {
     leader: u64,
+    epoch: u64,
     restart: u64,
     segment: u64,
     next: u64,
     started_ms: u64,
     scope: BTreeSet<u64>,
-    set: usize,
+    sets: Vec<BTreeSet<u64>>,
     acked: BTreeMap<u64, bool>,
 }
 
@@ -168,9 +178,6 @@ struct Frame {
 }
 
 type Vote = (BTreeSet<u64>, u64);
-type Answered = (Option<u64>, u64, u64, u64);
-type Inputs = (u64, u64, BTreeMap<u64, u64>);
-type Same = (u64, BTreeMap<u64, u64>, u64, u64);
 type PeerMarks = (Marks, Marks, u64, u64, BTreeSet<(u64, u64)>);
 type FenceAnswer = (BTreeSet<u64>, Marks, u64, BTreeSet<u64>);
 type SegAnswer = (Known, Marks, u64);
@@ -186,13 +193,13 @@ struct Disk {
     join_ms: u64,
     member: Option<Vec<u8>>,
     control: Saved,
-    groups: Option<Groups>,
     records: BTreeMap<(u64, u64), (u64, u64, u64)>,
     marks: Marks,
     forgot: Marks,
     sequence: u64,
     dropped: BTreeMap<u64, u64>,
     erased: BTreeSet<u64>,
+    epochs: BTreeMap<u64, u64>,
 }
 
 struct Node {
@@ -203,7 +210,7 @@ struct Node {
     signals: u8,
     phase_ms: u64,
     boot_run_ms: u64,
-    groups: Option<Groups>,
+    proposed_groups: Option<(u64, u64)>,
     stop_run_ms: Option<u64>,
     heavy: BTreeMap<u64, (Hold, u64)>,
     trips: BTreeMap<u64, (u64, u64)>,
@@ -213,17 +220,16 @@ struct Node {
     fences: BTreeMap<u64, BTreeSet<u64>>,
     unreachable: BTreeMap<u64, Option<u64>>,
     opened: Option<Floor>,
+    proposed: Option<(u64, Floor)>,
+    fall: Option<Cause>,
     raft: Control,
     heard_ms: Option<u64>,
     adopted_ms: u64,
     lose: BTreeSet<u64>,
     booted_ms: u64,
-    picked: BTreeMap<(u64, u64), (Option<u64>, u64, u64)>,
-    answered: BTreeMap<(u64, u64), Answered>,
-    lease: BTreeMap<(u64, u64), (u64, u64)>,
-    sent_inputs: BTreeMap<(u64, u64), Inputs>,
-    same: BTreeMap<u64, Same>,
-    differs: BTreeSet<u64>,
+    proposed_segs: BTreeSet<(u64, u64, u64, bool)>,
+    lease: BTreeMap<u64, Lease>,
+    changing: BTreeMap<u64, HolderSet>,
     fence_answers: BTreeMap<(u64, u64), FenceAnswer>,
     seen_records: BTreeMap<u64, u64>,
     records_asked: BTreeMap<u64, u64>,
@@ -241,7 +247,6 @@ struct Node {
     seg_queue: BTreeMap<(u64, u64), u64>,
     seg_asked: BTreeMap<(u64, u64), u64>,
     drops: BTreeMap<u64, BTreeSet<u64>>,
-    copies: BTreeMap<(u64, u64), bool>,
 }
 
 pub struct Segment {
@@ -255,8 +260,6 @@ pub struct Segment {
     pub marks: BTreeMap<u64, u64>,
     pub born: BTreeSet<u64>,
     pub stream: u64,
-    pub sets: BTreeMap<u64, HolderSet>,
-    pub seen: BTreeMap<u64, Marks>,
     copied: BTreeMap<u64, u64>,
 }
 
@@ -308,14 +311,11 @@ pub struct World {
     pub asks_doubled: u64,
     pub records_max: usize,
     pub record_frames: u64,
-    pub pick_frames: u64,
-    pub set_frames: u64,
     pub seg_asks: u64,
     pub settle_tries: u64,
     pub partial_reads: u64,
     pub incomplete_reads: u64,
     pub refused_settles: u64,
-    pub groups_writes: Vec<(u64, u64, u64)>,
     pub commit_ms: u64,
     pub stopped_at: BTreeMap<u64, u64>,
     pub removed_at: BTreeMap<u64, u64>,
@@ -327,6 +327,7 @@ pub struct World {
     settles: BTreeMap<u64, Settle>,
     drop_waits: BTreeMap<u64, (u64, u64, BTreeSet<u64>)>,
     next_request: u64,
+    wishes: BTreeMap<(u64, u64), (u64, HolderSet)>,
     cut_ms: BTreeMap<(u64, u64), u64>,
     linked_ms: BTreeMap<(u64, u64), u64>,
     applied_ms: BTreeMap<(u64, u64), u64>,
@@ -347,28 +348,29 @@ pub struct World {
     next_disk: u64,
     next_segment: u64,
     changed_run_ms: u64,
+    decisions: BTreeMap<Floor, FloorChange>,
     cursor: usize,
 }
 
-fn learn(seg: &mut Segment, to: u64, set: &HolderSet, seen: &Marks) -> Option<BTreeSet<u64>> {
-    let before: BTreeSet<u64> = seg
-        .sets
-        .get(&to)
-        .map(|s| s.holders.clone())
-        .unwrap_or_default();
-    let merged = match seg.sets.get(&to) {
-        Some(own) => own.clone().merge(set.clone()),
-        None => set.clone(),
-    };
-    let mut marks = seg.seen.get(&to).cloned().unwrap_or_default();
-    for (origin, mark) in seen {
-        let own = marks.entry(*origin).or_insert(0);
-        *own = (*own).max(*mark);
-    }
-    let changed = seg.sets.get(&to) != Some(&merged) || seg.seen.get(&to) != Some(&marks);
-    seg.sets.insert(to, merged);
-    seg.seen.insert(to, marks);
-    changed.then_some(before)
+fn heard(node: &Node, id: u64, m: &verdandi_control::Segment) -> bool {
+    let from = node
+        .lease
+        .get(&id)
+        .filter(|l| l.epoch == m.leader_epoch)
+        .map_or(0, |l| l.from.len());
+    fence::confirmed(from + 1, m.holders.holders.len())
+}
+
+fn synced(node: &Node, id: u64, m: &verdandi_control::Segment) -> bool {
+    m.leader_epoch == 1 || heard(node, id, m)
+}
+
+fn enough_in(set: &BTreeSet<u64>, leader: u64, stored: &BTreeSet<u64>) -> bool {
+    let copies = set
+        .iter()
+        .filter(|h| **h == leader || stored.contains(h))
+        .count();
+    fence::enough(copies, set.len())
 }
 
 fn fingerprint(set: &HolderSet) -> u64 {
@@ -431,14 +433,11 @@ impl World {
             asks_doubled: 0,
             records_max: 0,
             record_frames: 0,
-            pick_frames: 0,
-            set_frames: 0,
             seg_asks: 0,
             settle_tries: 0,
             partial_reads: 0,
             incomplete_reads: 0,
             refused_settles: 0,
-            groups_writes: Vec::new(),
             commit_ms: 0,
             stopped_at: BTreeMap::new(),
             removed_at: BTreeMap::new(),
@@ -450,6 +449,7 @@ impl World {
             settles: BTreeMap::new(),
             drop_waits: BTreeMap::new(),
             next_request: 1,
+            wishes: BTreeMap::new(),
             cut_ms: BTreeMap::new(),
             linked_ms: BTreeMap::new(),
             applied_ms: BTreeMap::new(),
@@ -470,6 +470,7 @@ impl World {
             next_disk: 1,
             next_segment: 1,
             changed_run_ms: 0,
+            decisions: BTreeMap::new(),
             cursor: 0,
         }
     }
@@ -565,17 +566,11 @@ impl World {
     }
 
     pub fn groups_epoch(&self, disk: u64) -> Option<u64> {
-        self.nodes.get(&disk)?.groups.as_ref().map(|g| g.epoch)
+        groups_of(self.nodes.get(&disk)?).map(|g| g.epoch)
     }
 
     pub fn is_groups_writer(&self, disk: u64) -> bool {
-        let Some(node) = self.nodes.get(&disk) else {
-            return false;
-        };
-        let epoch = node.groups.as_ref().map_or(0, |g| g.epoch);
-        let (mut ring, _) = self.ring_of(disk);
-        ring.retain(|d| self.live_reconciled(disk, *d));
-        placement::writer(epoch, &ring) == Some(disk)
+        self.nodes.get(&disk).is_some_and(|n| n.raft.is_leader())
     }
 
     fn majority(&self, h: u64) -> bool {
@@ -586,6 +581,7 @@ impl World {
                         m.members.iter().filter(|x| self.link(h, **x)).count(),
                         m.members.len(),
                     )
+                    && self.raft_leader().is_none_or(|l| self.link(h, l))
             })
     }
 
@@ -685,13 +681,13 @@ impl World {
                 join_ms: self.run_ms,
                 member: None,
                 control: Saved::default(),
-                groups: None,
                 records: BTreeMap::new(),
                 marks: Marks::new(),
                 forgot: Marks::new(),
                 sequence: 0,
                 dropped: BTreeMap::new(),
                 erased: BTreeSet::new(),
+                epochs: BTreeMap::new(),
             },
         );
         if !self.sides.is_empty() {
@@ -714,13 +710,15 @@ impl World {
         if let Some(first) = ids.first().copied() {
             let found = Control::found(first).expect("the founding state restores");
             let saved = found.save().expect("the founding state saves");
-            if let (Some(node), Some(disk)) = (self.nodes.get_mut(&first), self.disks.get_mut(&first)) {
+            if let (Some(node), Some(disk)) =
+                (self.nodes.get_mut(&first), self.disks.get_mut(&first))
+            {
                 node.raft = found;
                 disk.control = saved;
             }
             let all: BTreeSet<u64> = ids.iter().copied().collect();
             for _ in 0..FOUNDING_STEPS {
-                if self.newest().is_some_and(|m| m.members == all) {
+                if self.newest().is_some_and(|m| m.members == all) && self.grouped() {
                     break;
                 }
                 self.advance(STEP_MS);
@@ -757,7 +755,6 @@ impl World {
             host,
             prefix,
             holds: self.holds(disk),
-            floor: d.floor,
             ..Body::default()
         }
     }
@@ -773,8 +770,8 @@ impl World {
         d.restart += 1;
         let (restart, floor, committed, run) = (d.restart, d.floor, d.committed, d.alive_ms);
         let member = d.member.clone();
-        let groups = d.groups.clone();
-        let raft = Control::restore(disk, d.control.clone()).expect("the saved control state restores");
+        let raft =
+            Control::restore(disk, d.control.clone()).expect("the saved control state restores");
         let body = self.body(disk, format_max);
         let phase_ms = self.rng.random_range(0..SAMPLE_MS / STEP_MS) * STEP_MS;
         let (view, count) = match member {
@@ -794,7 +791,7 @@ impl World {
                 signals: 0,
                 phase_ms,
                 boot_run_ms: run,
-                groups,
+                proposed_groups: None,
                 stop_run_ms: None,
                 heavy: BTreeMap::new(),
                 trips: BTreeMap::new(),
@@ -804,17 +801,16 @@ impl World {
                 fences: BTreeMap::new(),
                 unreachable: BTreeMap::new(),
                 opened: None,
+                proposed: None,
+                fall: None,
                 raft,
                 heard_ms: None,
                 adopted_ms: self.now_ms,
                 lose: BTreeSet::new(),
                 booted_ms: self.now_ms,
-                picked: BTreeMap::new(),
-                answered: BTreeMap::new(),
+                proposed_segs: BTreeSet::new(),
                 lease: BTreeMap::new(),
-                sent_inputs: BTreeMap::new(),
-                same: BTreeMap::new(),
-                differs: BTreeSet::new(),
+                changing: BTreeMap::new(),
                 fence_answers: BTreeMap::new(),
                 seen_records: BTreeMap::new(),
                 records_asked: BTreeMap::new(),
@@ -832,7 +828,6 @@ impl World {
                 seg_queue: BTreeMap::new(),
                 seg_asked: BTreeMap::new(),
                 drops: BTreeMap::new(),
-                copies: BTreeMap::new(),
             },
         );
         self.sends.insert(disk, Limiter::new(self.now_ms));
@@ -869,7 +864,12 @@ impl World {
         let ids: Vec<u64> = self
             .segments
             .iter()
-            .filter(|(_, s)| s.sets.contains_key(&disk) || s.marks.contains_key(&disk))
+            .filter(|(id, s)| {
+                s.marks.contains_key(&disk)
+                    || self
+                        .set_of(disk, **id)
+                        .is_some_and(|set| set.holders.contains(&disk))
+            })
             .map(|(id, _)| *id)
             .collect();
         if let Some(node) = self.nodes.get_mut(&disk) {
@@ -877,12 +877,10 @@ impl World {
         }
         for id in ids {
             self.catch_up(disk, id);
-            if let Some(seg) = self.segments.get_mut(&id)
-                && seg
-                    .sets
-                    .get(&disk)
-                    .is_none_or(|s| !s.holders.contains(&disk))
-            {
+            let dropped = self
+                .set_of(disk, id)
+                .is_some_and(|set| !set.holders.contains(&disk));
+            if dropped && let Some(seg) = self.segments.get_mut(&id) {
                 seg.marks.remove(&disk);
             }
         }
@@ -895,7 +893,7 @@ impl World {
             .nodes
             .get(&disk)
             .is_some_and(|n| n.view.own().body.holds > 0);
-        if held {
+        if held && !self.drained.contains(&disk) {
             self.losses.push(WorldLoss {
                 disk,
                 run_ms: self.run_ms,
@@ -966,8 +964,6 @@ impl World {
         self.disks.remove(&disk);
         for segment in self.segments.values_mut() {
             segment.marks.remove(&disk);
-            segment.sets.remove(&disk);
-            segment.seen.remove(&disk);
         }
     }
 
@@ -994,7 +990,16 @@ impl World {
     }
 
     fn remaining(&self, disk: u64) -> usize {
-        let floor = self.nodes.get(&disk).map_or(0, |n| n.ctl.floor.value);
+        let others = self
+            .nodes
+            .keys()
+            .filter(|h| **h != disk && self.serving(**h))
+            .count();
+        let floor = self
+            .nodes
+            .get(&disk)
+            .map_or(0, |n| usize::from(n.ctl.floor.value))
+            .min(others);
         self.segments
             .values()
             .filter(|s| s.marks.contains_key(&disk))
@@ -1003,7 +1008,7 @@ impl World {
                     .keys()
                     .filter(|h| **h != disk && self.serving(**h))
                     .count()
-                    < usize::from(floor)
+                    < floor
             })
             .count()
     }
@@ -1074,29 +1079,86 @@ impl World {
         true
     }
 
-    fn lower(&mut self, cause: Cause, disks: Vec<u64>) {
-        let run = self.run_ms;
-        for disk in disks {
-            let Some(node) = self.nodes.get_mut(&disk) else {
-                continue;
-            };
-            let from = node.ctl.floor;
-            if let Some(to) = node.ctl.lower() {
-                if let Some(d) = self.disks.get_mut(&disk) {
-                    d.floor = to;
-                }
-                self.floor_changes.push(FloorChange {
-                    run_ms: run,
-                    disk,
-                    from,
-                    to,
-                    cause,
-                    debt_ok: true,
-                    majority: true,
-                    counts_ok: true,
-                });
-            }
+    fn propose_floor(&mut self, disk: u64, to: Floor, cause: Cause) {
+        let (run, settled) = (self.run_ms, self.run_ms >= self.changed_run_ms + SLACK_MS);
+        let side = self.side(disk);
+        let (debt_ok, majority, counts_ok) = match cause {
+            Cause::Rise | Cause::Quiet => (
+                self.debt_truth(to.value, &side),
+                self.listed(disk),
+                !settled || self.counts_ok(&side, to.value),
+            ),
+            _ => (true, true, true),
+        };
+        let Some(node) = self.nodes.get_mut(&disk) else {
+            return;
+        };
+        let key = (node.raft.term(), to);
+        if node.proposed == Some(key) {
+            return;
         }
+        node.proposed = Some(key);
+        let from = node.raft.meta().floor;
+        self.raft_refused += u64::from(node.raft.propose(&Command::Floor(to)).is_err());
+        self.decisions.insert(
+            to,
+            FloorChange {
+                run_ms: run,
+                disk,
+                from,
+                to,
+                cause,
+                debt_ok,
+                majority,
+                counts_ok,
+            },
+        );
+        self.flush(disk);
+    }
+
+    fn fall(&mut self, disk: u64) {
+        let Some(node) = self.nodes.get_mut(&disk) else {
+            return;
+        };
+        let Some(cause) = node.fall else {
+            return;
+        };
+        if !node.raft.is_leader() {
+            node.fall = None;
+            return;
+        }
+        match node.ctl.lower() {
+            Some(to) => {
+                node.ctl.floor = node.raft.meta().floor;
+                self.propose_floor(disk, to, cause);
+            }
+            None => node.fall = None,
+        }
+    }
+
+    fn floor_applied(&mut self, disk: u64, from: Floor, to: Floor) {
+        let Some(node) = self.nodes.get_mut(&disk) else {
+            return;
+        };
+        node.ctl.floor = to;
+        node.proposed = None;
+        if let Some(d) = self.disks.get_mut(&disk) {
+            d.floor = to;
+        }
+        let change = match self.decisions.remove(&to) {
+            Some(made) => FloorChange { disk, from, ..made },
+            None => FloorChange {
+                run_ms: self.run_ms,
+                disk,
+                from,
+                to,
+                cause: Cause::Merge,
+                debt_ok: true,
+                majority: true,
+                counts_ok: true,
+            },
+        };
+        self.floor_changes.push(change);
     }
 
     fn serving(&self, disk: u64) -> bool {
@@ -1149,19 +1211,15 @@ impl World {
         }
         let set = HolderSet {
             segment: id,
-            epoch: 0,
+            epoch: 1,
             writer,
             holders: holders.iter().copied().collect(),
         };
+        self.wish(writer, set.clone());
         self.segments.insert(
             id,
             Segment {
                 writer,
-                sets: stored.iter().map(|h| (*h, set.clone())).collect(),
-                seen: stored
-                    .iter()
-                    .map(|h| (*h, Marks::from([(writer, 1)])))
-                    .collect(),
                 copied: stored.iter().map(|h| (*h, self.now_ms)).collect(),
                 holders: set,
                 bytes,
@@ -1204,7 +1262,7 @@ impl World {
             self.refused_writes += 1;
             return None;
         }
-        let groups = node.groups.as_ref()?;
+        let groups = groups_of(node)?;
         let late: Vec<u64> = node.unreachable.keys().copied().collect();
         let mut holders = groups.new_holders(writer, self.next_segment, &late);
         let confirmed: BTreeSet<u64> = holders
@@ -1251,56 +1309,213 @@ impl World {
         }
     }
 
-    fn deliver(&mut self, from: u64, set: HolderSet) {
-        let id = set.segment;
-        let Some(seg) = self.segments.get_mut(&id) else {
-            return;
-        };
-        let old: BTreeSet<u64> = seg
-            .sets
-            .get(&from)
-            .map(|s| s.holders.clone())
-            .unwrap_or_default();
-        seg.holders = seg.holders.clone().merge(set.clone());
-        self.take_set(id, from, &set, &Marks::from([(from, set.epoch + 1)]));
-        self.spread(id, from, old);
+    pub fn set_of(&self, n: u64, id: u64) -> Option<&HolderSet> {
+        self.nodes
+            .get(&n)?
+            .raft
+            .meta()
+            .segments
+            .get(&id)
+            .map(|s| &s.holders)
+            .filter(|h| h.epoch > 0)
     }
 
-    fn take_set(
-        &mut self,
-        id: u64,
-        to: u64,
-        set: &HolderSet,
-        seen: &Marks,
-    ) -> Option<BTreeSet<u64>> {
-        let seg = self.segments.get_mut(&id)?;
-        let before = learn(seg, to, set, seen);
-        if seg.sets.get(&to).is_some_and(|s| !s.holders.contains(&to)) {
-            seg.marks.remove(&to);
-        }
-        before
+    fn epoch_of(&self, n: u64, id: u64) -> u64 {
+        self.nodes
+            .get(&n)
+            .and_then(|node| node.raft.meta().segments.get(&id))
+            .map_or(0, |m| m.leader_epoch)
     }
 
-    fn spread(&mut self, id: u64, from: u64, old: BTreeSet<u64>) {
-        let seg = &self.segments[&id];
-        let (Some(set), Some(seen)) = (seg.sets.get(&from).cloned(), seg.seen.get(&from).cloned())
-        else {
-            return;
-        };
-        let copy = seg.marks.contains_key(&from);
-        let targets: Vec<u64> = set
-            .holders
-            .union(&old)
+    fn open_epoch(&self, n: u64, id: u64) -> u64 {
+        let held = self
+            .disks
+            .get(&n)
+            .and_then(|d| d.epochs.get(&id))
             .copied()
-            .filter(|u| *u != from)
+            .unwrap_or(0);
+        held.max(self.epoch_of(n, id))
+    }
+
+    fn hold_epoch(&mut self, n: u64, id: u64, epoch: u64) -> u64 {
+        if let Some(d) = self.disks.get_mut(&n) {
+            let held = d.epochs.entry(id).or_insert(0);
+            *held = (*held).max(epoch);
+        }
+        self.open_epoch(n, id)
+    }
+
+    fn leads(&self, n: u64, id: u64) -> bool {
+        let (Some(node), Some(seg)) = (self.nodes.get(&n), self.segments.get(&id)) else {
+            return false;
+        };
+        let Some(m) = node.raft.meta().segments.get(&id) else {
+            return false;
+        };
+        let holders = &m.holders.holders;
+        m.leader == n
+            && holders.contains(&n)
+            && seg.marks.contains_key(&n)
+            && self.open_epoch(n, id) <= m.leader_epoch
+            && node.lease.get(&id).is_some_and(|l| {
+                let beats = holders
+                    .iter()
+                    .filter(|h| {
+                        **h != n && l.beats.get(h).is_some_and(|t| self.now_ms < t + LEASE_MS)
+                    })
+                    .count();
+                l.epoch == m.leader_epoch
+                    && fence::confirmed(beats + 1, holders.len())
+                    && (m.leader_epoch == 1
+                        || l.synced_ms
+                            .is_some_and(|t| self.now_ms >= t + LEASE_MS + STEP_MS))
+            })
+    }
+
+    fn send_beats(&mut self) {
+        let now = self.now_ms;
+        let mut beats = Vec::new();
+        for (n, node) in &self.nodes {
+            for (id, m) in &node.raft.meta().segments {
+                if m.leader == *n && m.holders.holders.contains(n) && synced(node, *id, m) {
+                    beats.push((*n, *id, m.leader_epoch, m.holders.holders.clone()));
+                }
+            }
+        }
+        for (n, id, epoch, holders) in beats {
+            if let Some(node) = self.nodes.get_mut(&n) {
+                let lease = node.lease.entry(id).or_default();
+                if lease.epoch != epoch {
+                    *lease = Lease {
+                        epoch,
+                        ..Lease::default()
+                    };
+                }
+                lease.synced_ms.get_or_insert(now);
+            }
+            for h in holders.into_iter().filter(|h| *h != n) {
+                self.send(n, h, Msg::Beat(id, epoch));
+            }
+        }
+    }
+
+    fn add_holder(&mut self, leader: u64, own: &HolderSet, new: u64) {
+        if [3,4,5].contains(&own.segment) { eprintln!("ADD {} leader={leader} seg={} own={:?} new={new}", self.now_ms, own.segment, own); }
+        let mut holders = own.holders.clone();
+        holders.insert(new);
+        let set = own.with(leader, holders);
+        if let Some(node) = self.nodes.get_mut(&leader) {
+            node.changing.insert(own.segment, set.clone());
+        }
+        self.wish(leader, set);
+    }
+
+    fn wish(&mut self, by: u64, set: HolderSet) {
+        self.wishes
+            .entry((set.segment, set.epoch))
+            .or_insert((by, set));
+    }
+
+    fn open_wishes(&mut self) {
+        let keys: Vec<(u64, u64)> = self.wishes.keys().copied().collect();
+        for key in keys {
+            let applied = self.nodes.values().any(|n| {
+                n.raft
+                    .meta()
+                    .segments
+                    .get(&key.0)
+                    .is_some_and(|s| s.holders.epoch >= key.1)
+            });
+            let (by, set) = self.wishes[&key].clone();
+            if applied {
+                self.wishes.remove(&key);
+                continue;
+            }
+            let Some(sender) = Some(by).filter(|b| self.nodes.contains_key(b)).or_else(|| {
+                set.holders
+                    .iter()
+                    .copied()
+                    .find(|h| self.nodes.contains_key(h))
+            }) else {
+                continue;
+            };
+            let node = &self.nodes[&sender];
+            if node.raft.is_leader() {
+                self.propose_segment(sender, Command::Holders(set));
+            } else if let Some(leader) = node.raft.leader() {
+                self.send(sender, leader, Msg::Wish(set));
+            }
+        }
+    }
+
+    fn propose_segment(&mut self, disk: u64, command: Command) {
+        let (segment, epoch, leader) = match &command {
+            Command::Holders(h) => (h.segment, h.epoch, false),
+            Command::Leader { segment, epoch, .. } => (*segment, *epoch, true),
+            _ => return,
+        };
+        let Some(node) = self.nodes.get_mut(&disk).filter(|n| n.raft.is_leader()) else {
+            return;
+        };
+        if !node
+            .proposed_segs
+            .insert((node.raft.term(), segment, epoch, leader))
+        {
+            return;
+        }
+        self.raft_refused += u64::from(node.raft.propose(&command).is_err());
+        self.flush(disk);
+        if let Command::Holders(h) = command
+            && h.epoch == 1
+        {
+            self.propose_segment(
+                disk,
+                Command::Leader {
+                    segment,
+                    epoch: 1,
+                    disk: h.writer,
+                },
+            );
+        }
+    }
+
+    fn lead_segments(&mut self, disk: u64) {
+        let Some(node) = self.nodes.get(&disk).filter(|n| n.raft.is_leader()) else {
+            return;
+        };
+        let pairs = self.reported(disk);
+        let copy = |id: u64, h: u64| self.segments[&id].marks.contains_key(&h);
+        let usable =
+            |id: u64, h: u64| self.serving(h) && self.live_reconciled(disk, h) && copy(id, h);
+        let picks: Vec<Command> = node
+            .raft
+            .meta()
+            .segments
+            .iter()
+            .filter(|(id, s)| {
+                s.holders.epoch > 0
+                    && !(s.holders.holders.contains(&s.leader)
+                        && usable(**id, s.leader)
+                        && !s.holders.holders.iter().any(|o| {
+                            *o != s.leader && pairs.contains(&placement::pair(s.leader, *o))
+                        }))
+            })
+            .filter_map(|(id, s)| {
+                let leader = placement::leader(0, &s.holders, |h| usable(*id, h), &pairs)?;
+                Some(Command::Leader {
+                    segment: *id,
+                    epoch: s.leader_epoch + 1,
+                    disk: leader,
+                })
+            })
             .collect();
-        for u in targets {
-            self.send(from, u, Msg::Set(id, set.clone(), seen.clone(), copy));
+        for command in picks {
+            self.propose_segment(disk, command);
         }
     }
 
     fn catch_up(&mut self, disk: u64, id: u64) {
-        let Some(own) = self.segments.get(&id).and_then(|s| s.sets.get(&disk)) else {
+        let Some(own) = self.set_of(disk, id) else {
             return;
         };
         let peers: Vec<u64> = own.holders.iter().copied().filter(|h| *h != disk).collect();
@@ -1348,7 +1563,8 @@ impl World {
             }
         }
         for (n, (id, peer)) in asks {
-            self.send(n, peer, Msg::SegAsk(id));
+            let epoch = self.epoch_of(n, id);
+            self.send(n, peer, Msg::SegAsk(id, epoch));
         }
     }
 
@@ -1386,136 +1602,6 @@ impl World {
         pairs
     }
 
-    fn leads(&self, n: u64, id: u64) -> bool {
-        let (Some(node), Some(seg)) = (self.nodes.get(&n), self.segments.get(&id)) else {
-            return false;
-        };
-        let Some(set) = seg.sets.get(&n) else {
-            return false;
-        };
-        let now = self.now_ms;
-        let view = OnceCell::new();
-        let agreed = |c: u64| {
-            let restart = node.view.entry(c).map(|e| e.head.restart);
-            let picked = node
-                .picked
-                .get(&(id, c))
-                .filter(|(pick, sent, run)| {
-                    *pick == Some(n) && now < sent + 2 * FENCE_MS && Some(*run) == restart
-                })
-                .map(|p| p.1);
-            picked.max(self.same_inputs(n, c, id, &view))
-        };
-        seg.marks.contains_key(&n)
-            && set.holders.contains(&n)
-            && self.pick(n, id) == Some(n)
-            && set
-                .holders
-                .iter()
-                .filter(|c| **c != n && self.near(n, **c) && !node.view.absent(**c))
-                .all(|c| agreed(*c).is_some())
-            && node
-                .lease
-                .range((id, 0)..=(id, u64::MAX))
-                .all(|((_, a), (until, last))| {
-                    now >= *until || agreed(*a).is_some_and(|sent| sent >= *last)
-                })
-            && !self.segment_fenced(
-                n,
-                id,
-                &mut node.fences.get(&id).cloned().unwrap_or_default(),
-            )
-    }
-
-    fn same_inputs(&self, n: u64, c: u64, id: u64, view: &OnceCell<u64>) -> Option<u64> {
-        let node = &self.nodes[&n];
-        let restart = node.view.entry(c).map(|e| e.head.restart);
-        let set = self.segments[&id]
-            .sets
-            .get(&n)
-            .map(|s| self.seg_input(n, id, s));
-        node.same
-            .get(&c)
-            .filter(|(seen, sets, sent, run)| {
-                sets.get(&id).copied() == set
-                    && self.now_ms < sent + 2 * FENCE_MS
-                    && Some(*run) == restart
-                    && *view.get_or_init(|| self.view_inputs(n)) == *seen
-            })
-            .map(|s| s.2)
-    }
-
-    fn view_inputs(&self, by: u64) -> u64 {
-        let reconciled: Vec<u64> = self
-            .disks
-            .keys()
-            .copied()
-            .filter(|d| self.live_reconciled(by, *d))
-            .collect();
-        let mut h = DefaultHasher::new();
-        (self.reported(by), reconciled).hash(&mut h);
-        h.finish()
-    }
-
-    fn inputs(&self, by: u64, peer: u64) -> Inputs {
-        let sets: BTreeMap<u64, u64> = self
-            .segments
-            .iter()
-            .filter_map(|(id, s)| {
-                s.sets
-                    .get(&by)
-                    .filter(|set| set.holders.contains(&by) && set.holders.contains(&peer))
-                    .map(|set| (*id, self.seg_input(by, *id, set)))
-            })
-            .collect();
-        let view = self.view_inputs(by);
-        let mut h = DefaultHasher::new();
-        (view, &sets).hash(&mut h);
-        (h.finish(), view, sets)
-    }
-
-    fn lease(&mut self, by: u64, asker: u64, id: u64, pick: Option<u64>) {
-        let now = self.now_ms;
-        if pick == Some(asker)
-            && let Some(node) = self.nodes.get_mut(&by)
-        {
-            node.lease.insert((id, asker), (now + 2 * FENCE_MS, now));
-        }
-    }
-
-    fn pick(&self, by: u64, id: u64) -> Option<u64> {
-        let seg = &self.segments[&id];
-        placement::leader(
-            0,
-            seg.sets.get(&by)?,
-            |h| self.live_reconciled(by, h) && self.has_copy(by, id, h),
-            &self.reported(by),
-        )
-    }
-
-    fn has_copy(&self, by: u64, id: u64, h: u64) -> bool {
-        if by == h {
-            return self.segments[&id].marks.contains_key(&by);
-        }
-        self.nodes[&by]
-            .copies
-            .get(&(id, h))
-            .copied()
-            .unwrap_or(true)
-    }
-
-    fn seg_input(&self, by: u64, id: u64, set: &HolderSet) -> u64 {
-        let none: Vec<u64> = set
-            .holders
-            .iter()
-            .copied()
-            .filter(|h| !self.has_copy(by, id, *h))
-            .collect();
-        let mut h = DefaultHasher::new();
-        (fingerprint(set), none).hash(&mut h);
-        h.finish()
-    }
-
     fn show(&mut self, n: u64, id: u64) {
         let Some(seg) = self.segments.get(&id) else {
             return;
@@ -1546,7 +1632,11 @@ impl World {
             if leaders.len() > 1 {
                 self.double_leaders += 1;
             }
-            for n in leaders {
+            let serving: Vec<u64> = leaders
+                .into_iter()
+                .filter(|n| self.live_reconciled(*n, *n))
+                .collect();
+            for n in serving {
                 let mark = self.segments[&id].marks[&n];
                 if self.settled.get(&id).is_some_and(|s| mark < *s) {
                     self.redelivered += 1;
@@ -1574,7 +1664,7 @@ impl World {
                 .copied()
                 .filter(|p| {
                     self.live_reconciled(*p, *p)
-                        && seg.sets.get(p).is_some_and(|s| s.holders.contains(p))
+                        && self.set_of(*p, id).is_some_and(|s| s.holders.contains(p))
                         && !self.segment_fenced(
                             *p,
                             id,
@@ -1612,7 +1702,7 @@ impl World {
             && seg.marks.keys().any(|p| {
                 self.link(reader, *p)
                     && self.live_reconciled(reader, *p)
-                    && seg.sets.get(p).is_some_and(|s| s.holders.contains(p))
+                    && self.set_of(*p, id).is_some_and(|s| s.holders.contains(p))
             })
     }
 
@@ -1622,7 +1712,7 @@ impl World {
 
     fn picks(&self, p: u64, id: u64) -> bool {
         let seg = &self.segments[&id];
-        seg.sets.get(&p).is_some_and(|set| {
+        self.set_of(p, id).is_some_and(|set| {
             placement::pick(
                 &[id],
                 set.holders
@@ -1709,7 +1799,10 @@ impl World {
             return false;
         };
         let view = &self.nodes[&decider].view;
-        let co: BTreeSet<u64> = seg.sets[&decider]
+        let Some(set) = self.set_of(decider, id) else {
+            return false;
+        };
+        let co: BTreeSet<u64> = set
             .holders
             .iter()
             .copied()
@@ -1856,10 +1949,9 @@ impl World {
     }
 
     pub fn groups(&self) -> Option<Groups> {
-        self.nodes
-            .values()
-            .filter_map(|n| n.groups.clone())
-            .reduce(Groups::merge)
+        self.newest()
+            .map(|m| m.groups.clone())
+            .filter(|g| g.epoch > 0)
     }
 
     fn ring_of(&self, disk: u64) -> (Vec<u64>, BTreeMap<u64, u64>) {
@@ -1897,7 +1989,7 @@ impl World {
         let node = self.nodes.get(&disk)?;
         let (ring, domain) = self.ring_of(disk);
         placement::next(
-            node.groups.as_ref(),
+            groups_of(node),
             &ring,
             &domain,
             &self.reported(disk),
@@ -1905,46 +1997,30 @@ impl World {
         )
     }
 
-    fn give(&mut self, to: u64, groups: Option<Groups>) {
-        let (Some(g), Some(node)) = (groups, self.nodes.get_mut(&to)) else {
-            return;
-        };
-        node.groups = Some(match node.groups.take() {
-            Some(own) => own.merge(g),
-            None => g,
-        });
-    }
-
     fn write_groups(&mut self, disk: u64) {
         let Some(node) = self.nodes.get(&disk) else {
             return;
         };
-        if !self.live_reconciled(disk, disk) {
+        if !node.raft.is_leader() {
             return;
         }
         let started = self.run_of(disk) - node.boot_run_ms;
-        if node.groups.is_none() && !placement::ready(node.domains.is_some(), started) {
-            return;
-        }
-        let epoch = node.groups.as_ref().map_or(0, |g| g.epoch);
-        let (mut ring, _) = self.ring_of(disk);
-        ring.retain(|d| self.live_reconciled(disk, *d));
-        if placement::writer(epoch, &ring) != Some(disk) {
+        if groups_of(node).is_none() && !placement::ready(node.domains.is_some(), started) {
             return;
         }
         let Some(made) = self.next_groups(disk) else {
             return;
         };
-        if self
-            .requests
-            .values()
-            .any(|r| r.origin == disk && matches!(r.rec, Rec::Groups(_)))
-        {
+        let Some(node) = self.nodes.get_mut(&disk) else {
+            return;
+        };
+        let key = (node.raft.term(), made.epoch);
+        if node.proposed_groups == Some(key) {
             return;
         }
-        let side = self.side(disk).first().copied().unwrap_or(disk);
-        self.groups_writes.push((self.now_ms, side, made.epoch));
-        self.announce(disk, Rec::Groups(made));
+        node.proposed_groups = Some(key);
+        self.raft_refused += u64::from(node.raft.propose(&Command::Groups(made)).is_err());
+        self.flush(disk);
     }
 
     fn jobs(&self, cursor: Option<usize>) -> (Vec<Job>, Vec<(u64, HolderSet)>) {
@@ -1955,7 +2031,7 @@ impl World {
             .nodes
             .iter()
             .filter_map(|(n, node)| {
-                let groups = node.groups.as_ref()?;
+                let groups = groups_of(node)?;
                 let live = known
                     .iter()
                     .copied()
@@ -1985,13 +2061,14 @@ impl World {
                 continue;
             }
             let complete = |_: u64, d: u64| seg.marks.contains_key(&d);
+            let leader = seg.marks.keys().copied().find(|n| self.leads(*n, *id));
             let mut senders: BTreeMap<Vec<u64>, Option<u64>> = BTreeMap::new();
             for n in seg.marks.keys() {
                 let Some((groups, live_set, want)) = per.get(n) else {
                     continue;
                 };
                 let live = |d: u64| live_set.contains(&d);
-                let Some(set) = seg.sets.get(n) else {
+                let Some(set) = self.set_of(*n, *id) else {
                     continue;
                 };
                 let ready: Vec<u64> = set
@@ -2000,10 +2077,12 @@ impl World {
                     .copied()
                     .filter(|d| live(*d) && complete(*id, *d) && self.live_reconciled(*n, *d))
                     .collect();
-                let sender = *senders
-                    .entry(ready)
-                    .or_insert_with_key(|r| repair::sender(set, |d| r.contains(&d)));
-                let leads = self.leads(*n, *id);
+                let sender = leader.or_else(|| {
+                    *senders
+                        .entry(ready)
+                        .or_insert_with_key(|r| repair::sender(set, |d| r.contains(&d)))
+                });
+                let leads = leader == Some(*n);
                 if sender != Some(*n) && !leads {
                     continue;
                 }
@@ -2037,7 +2116,7 @@ impl World {
     }
 
     fn drains(&self, disk: u64, node: &Node) -> Vec<Job> {
-        let Some(next) = self.next_groups(disk).or_else(|| node.groups.clone()) else {
+        let Some(next) = self.next_groups(disk).or_else(|| groups_of(node).cloned()) else {
             return Vec::new();
         };
         let serving = |d: u64| {
@@ -2055,9 +2134,8 @@ impl World {
             .iter()
             .filter(|(id, s)| !self.held_repair.contains(id) && s.marks.contains_key(&disk))
             .filter_map(|(id, s)| {
-                let set = s
-                    .sets
-                    .get(&disk)
+                let set = self
+                    .set_of(disk, *id)
                     .filter(|set| set.holders.contains(&disk))?;
                 Some(Held {
                     writer: s.writer,
@@ -2093,14 +2171,23 @@ impl World {
                 seg.holders
             );
         }
-        let records: BTreeSet<Option<&Groups>> =
-            self.nodes.values().map(|n| n.groups.as_ref()).collect();
         let (copies, drops) = self.jobs(None);
+        self.grouped() && copies.is_empty() && drops.is_empty()
+    }
+
+    fn grouped(&self) -> bool {
+        let Some(members) = self.newest().map(|m| &m.members) else {
+            return false;
+        };
+        let voters: BTreeMap<&u64, &Node> = self
+            .nodes
+            .iter()
+            .filter(|(d, _)| members.contains(*d))
+            .collect();
+        let records: BTreeSet<Option<&Groups>> = voters.values().map(|n| groups_of(n)).collect();
         records.len() == 1
             && !records.contains(&None)
-            && copies.is_empty()
-            && drops.is_empty()
-            && self.nodes.keys().all(|d| self.next_groups(*d).is_none())
+            && voters.keys().all(|d| self.next_groups(**d).is_none())
     }
 
     pub fn settle_repair(&mut self, max_ms: u64) -> bool {
@@ -2156,9 +2243,7 @@ impl World {
             let Some(seg) = self.segments.get(&id) else {
                 continue;
             };
-            let Some(set) = seg.sets.get(&to) else {
-                continue;
-            };
+            let set = self.set_of(to, id).unwrap_or(&seg.holders);
             if self.nodes.contains_key(&to)
                 && fence::no_holder(
                     to,
@@ -2174,20 +2259,9 @@ impl World {
 
     fn drop_copies(&mut self, drops: Vec<(u64, HolderSet)>) {
         for (by, keep) in drops {
-            let Some(seg) = self.segments.get(&keep.segment) else {
-                continue;
-            };
-            let Some(own) = seg.sets.get(&by) else {
-                continue;
-            };
-            if keep.epoch != own.epoch + 1
-                || !keep.holders.iter().all(|h| self.nodes.contains_key(h))
-            {
-                continue;
+            if keep.holders.iter().all(|h| self.nodes.contains_key(h)) {
+                self.wish(by, keep);
             }
-            let from = seg.holders.clone();
-            self.deliver(by, keep.clone());
-            self.log(from, keep);
         }
     }
 
@@ -2220,6 +2294,11 @@ impl World {
                     active.push(*t);
                 }
             }
+            if now % 5000 == 0 && now >= 95000 && now <= 105000 {
+                let sr = self.sends.get_mut(&job.from).map(|l| l.available(now));
+                let tk: Vec<_> = job.to.iter().map(|t| (*t, self.takes.get_mut(t).map(|l| l.available(now)))).collect();
+                eprintln!("DBG {now} from={} seg={} need={} to={:?} active={:?} copying={:?} sends={:?} takes={:?} serving={:?} link={:?}", job.from, job.segment, job.need, job.to, active, self.copying.iter().filter(|(k,_)|k.0==job.segment).collect::<Vec<_>>(), sr, tk, job.to.iter().map(|t| self.serving(*t)).collect::<Vec<_>>(), job.to.iter().map(|t| self.link(3,*t)).collect::<Vec<_>>());
+            }
             for to in active {
                 let (Some(out), Some(inn)) =
                     (self.sends.get_mut(&job.from), self.takes.get_mut(&to))
@@ -2230,16 +2309,9 @@ impl World {
                 if room == 0 {
                     continue;
                 }
-                if !self.copying.contains_key(&(job.segment, to)) {
-                    let seg = &self.segments[&job.segment];
-                    let plan = seg.sets.get(&job.from).cloned();
-                    let seen = seg.seen.get(&job.from).cloned().unwrap_or_default();
-                    if let (Some(plan), Some(seg)) = (plan, self.segments.get_mut(&job.segment)) {
-                        learn(seg, to, &plan, &seen);
-                    }
-                }
                 let left = self.copying.entry((job.segment, to)).or_insert(bytes);
                 let step = room.min(*left);
+                if now >= 100000 && now <= 130000 && now % 5000 == 0 { eprintln!("SPEND {now} from={} seg={} to={} step={} left={}", job.from, job.segment, to, step, *left); }
                 out.spend(step);
                 inn.spend(step);
                 *left -= step;
@@ -2259,12 +2331,13 @@ impl World {
                 {
                     d.erased.insert(job.segment);
                 }
+                let own = self.set_of(job.from, job.segment).cloned();
                 let Some(seg) = self.segments.get_mut(&job.segment) else {
                     continue;
                 };
                 seg.marks.insert(to, mark);
                 seg.copied.insert(to, self.now_ms);
-                let Some(own) = seg.sets.get(&job.from).cloned() else {
+                let Some(own) = own else {
                     continue;
                 };
                 let co: BTreeSet<u64> = own.holders.iter().copied().filter(|h| *h != to).collect();
@@ -2281,17 +2354,19 @@ impl World {
                     node.named.extend(named);
                 }
                 if !own.holders.contains(&to) {
-                    let mut holders = own.holders.clone();
-                    holders.insert(to);
-                    let next = own.with(job.from, holders);
-                    let seen = Marks::from([(job.from, next.epoch + 1)]);
-                    learn(seg, to, &next, &seen);
-                    let from = seg.holders.clone();
-                    self.deliver(job.from, next.clone());
-                    self.log(from, next);
+                    if self.leads(job.from, job.segment) {
+                        self.add_holder(job.from, &own, to);
+                    } else if let Some(leader) = self.nodes[&job.from]
+                        .raft
+                        .meta()
+                        .segments
+                        .get(&job.segment)
+                        .map(|m| m.leader)
+                    {
+                        self.send(job.from, leader, Msg::Copied(job.segment, to, mark));
+                    }
                 }
                 self.catch_up(to, job.segment);
-                self.spread(job.segment, to, BTreeSet::new());
             }
         }
     }
@@ -2335,7 +2410,7 @@ impl World {
         let leaders: Vec<u64> = self
             .running()
             .into_iter()
-            .filter(|n| self.leads(*n, id))
+            .filter(|n| self.leads(*n, id) && self.live_reconciled(*n, *n))
             .collect();
         let Some(leader) = leaders.choose(&mut self.rng).copied() else {
             return;
@@ -2343,14 +2418,26 @@ impl World {
         self.settle_tries += 1;
         let seg = &self.segments[&id];
         let next = seg.marks[&leader] + 1;
-        let set = seg.sets[&leader].holders.len();
-        let scope: BTreeSet<u64> = seg.sets[&leader]
-            .holders
+        let Some(current) = self.set_of(leader, id) else {
+            return;
+        };
+        let node = &self.nodes[&leader];
+        let sets: Vec<BTreeSet<u64>> = std::iter::once(&current.holders)
+            .chain(
+                node.changing
+                    .get(&id)
+                    .filter(|c| c.epoch > current.epoch)
+                    .map(|c| &c.holders),
+            )
+            .cloned()
+            .collect();
+        let scope: BTreeSet<u64> = sets
             .iter()
+            .flatten()
             .copied()
             .filter(|h| *h != leader && !self.nodes[&leader].view.absent(*h))
             .collect();
-        if !fence::enough(scope.len() + 1, set) {
+        if !sets.iter().all(|set| enough_in(set, leader, &scope)) {
             self.refused_settles += 1;
             return;
         }
@@ -2363,19 +2450,21 @@ impl World {
         }
         let sid = self.next_request;
         self.next_request += 1;
+        let epoch = self.epoch_of(leader, id);
         for h in &scope {
-            self.send(leader, *h, Msg::Ack(sid, id, next));
+            self.send(leader, *h, Msg::Ack(sid, id, next, epoch));
         }
         self.settles.insert(
             sid,
             Settle {
                 leader,
+                epoch,
                 restart: self.disks[&leader].restart,
                 segment: id,
                 next,
                 started_ms: self.now_ms,
                 scope,
-                set,
+                sets,
                 acked: BTreeMap::new(),
             },
         );
@@ -2402,13 +2491,22 @@ impl World {
                     .copied()
                     .filter(|h| !s.acked.contains_key(h))
                     .collect();
-                let (leader, segment, next) = (s.leader, s.segment, s.next);
-                if fence::enough(scope.len() + 1, s.set) && !open.is_empty() {
+                let (leader, segment, next, epoch) = (s.leader, s.segment, s.next, s.epoch);
+                let stored: BTreeSet<u64> = s
+                    .acked
+                    .iter()
+                    .filter(|(_, c)| **c)
+                    .map(|(h, _)| *h)
+                    .collect();
+                if s.sets.iter().all(|set| enough_in(set, leader, &scope))
+                    && !open.is_empty()
+                    && !s.sets.iter().all(|set| enough_in(set, leader, &stored))
+                {
                     if let Some(s) = self.settles.get_mut(&sid) {
                         s.scope = scope;
                     }
                     for h in open {
-                        self.send(leader, h, Msg::Ack(sid, segment, next));
+                        self.send(leader, h, Msg::Ack(sid, segment, next, epoch));
                     }
                     continue;
                 }
@@ -2416,8 +2514,17 @@ impl World {
             let Some(s) = self.settles.remove(&sid) else {
                 continue;
             };
-            let copies = 1 + s.acked.values().filter(|c| **c).count();
-            if gone || !self.acts(s.leader) || !fence::enough(copies, s.set) {
+            let stored: BTreeSet<u64> = s
+                .acked
+                .iter()
+                .filter(|(_, c)| **c)
+                .map(|(h, _)| *h)
+                .collect();
+            if gone
+                || !self.leads(s.leader, s.segment)
+                || self.epoch_of(s.leader, s.segment) != s.epoch
+                || !s.sets.iter().all(|set| enough_in(set, s.leader, &stored))
+            {
                 self.refused_settles += 1;
             } else {
                 let settled = self.settled.entry(s.segment).or_insert(s.next);
@@ -2680,13 +2787,15 @@ impl World {
         }
         self.prune();
         self.ask_fences();
-        self.ask_picks();
+        self.open_wishes();
         self.send_seg_asks();
+        self.send_beats();
         self.resend_drops();
         self.answer_requests();
         self.answer_settles();
         for disk in &running {
             self.govern(*disk);
+            self.lead_segments(*disk);
         }
         if now.is_multiple_of(GOSSIP_MS) {
             for disk in &running {
@@ -2769,8 +2878,6 @@ impl World {
             }
             Msg::Records(records, ..) => self.records_max = self.records_max.max(records.len()),
             Msg::Record(..) => self.record_frames += 1,
-            Msg::Pick(..) => self.pick_frames += 1,
-            Msg::Set(..) => self.set_frames += 1,
             Msg::SegAsk(..) => self.seg_asks += 1,
             _ => {}
         }
@@ -2869,58 +2976,23 @@ impl World {
                 self.flush(to);
             }
             Msg::Lose(disk) => {
-                if let Some(node) = self.nodes.get_mut(&to).filter(|n| n.view.absent(disk)) {
+                if let Some(node) = self
+                    .nodes
+                    .get_mut(&to)
+                    .filter(|n| n.view.absent(disk) && n.raft.meta().members.contains(&disk))
+                {
                     node.lose.insert(disk);
-                }
-            }
-            Msg::Pick(id, asker, sent) => {
-                let pick = self.pick(to, id);
-                if let Some(node) = self.nodes.get_mut(&to) {
-                    node.answered.insert((id, f.from), (pick, now, asker, sent));
-                }
-                self.lease(to, f.from, id, pick);
-                let restart = self.disks[&to].restart;
-                self.send(to, f.from, Msg::Picked(id, pick, restart, asker, sent));
-            }
-            Msg::Picked(id, pick, restart, asker, sent) => {
-                if asker == self.disks[&to].restart
-                    && let Some(node) = self.nodes.get_mut(&to)
-                {
-                    node.picked.insert((id, f.from), (pick, sent, restart));
-                }
-            }
-            Msg::Inputs(hash, asker, sent) => {
-                let (own, _, sets) = self.inputs(to, f.from);
-                if own == hash {
-                    for id in sets.into_keys() {
-                        let pick = self.pick(to, id);
-                        self.lease(to, f.from, id, pick);
-                    }
-                }
-                let restart = self.disks[&to].restart;
-                let same = (own == hash).then_some(hash);
-                self.send(to, f.from, Msg::InputsIs(same, restart, asker, sent));
-            }
-            Msg::InputsIs(same, restart, asker, sent) => {
-                if asker == self.disks[&to].restart
-                    && let Some(node) = self.nodes.get_mut(&to)
-                {
-                    let asked = node.sent_inputs.remove(&(f.from, sent));
-                    match (same, asked) {
-                        (Some(hash), Some((mine, view, sets))) if hash == mine => {
-                            node.same.insert(f.from, (view, sets, sent, restart));
-                            node.differs.remove(&f.from);
-                        }
-                        _ => {
-                            node.differs.insert(f.from);
-                        }
-                    }
                 }
             }
             Msg::Record(id, origin, rec, cut) => {
                 self.take_record(to, f.from, id, origin, rec, cut);
             }
-            Msg::Ack(sid, id, next) => {
+            Msg::Ack(sid, id, next, epoch) => {
+                let held = self.hold_epoch(to, id, epoch);
+                if held > epoch {
+                    self.send(to, f.from, Msg::Acked(sid, false, held));
+                    return;
+                }
                 let mark = self
                     .segments
                     .get_mut(&id)
@@ -2935,77 +3007,99 @@ impl World {
                 if let Some(node) = self.nodes.get_mut(&to).filter(|_| copy) {
                     node.caught.insert((id, to), f.sent);
                 }
-                self.send(to, f.from, Msg::Acked(sid, copy));
+                self.send(to, f.from, Msg::Acked(sid, copy, epoch));
             }
-            Msg::Set(id, set, seen, copy) => {
-                if !self.segments.contains_key(&id) {
-                    return;
-                }
-                if let Some(node) = self.nodes.get_mut(&to) {
-                    node.copies.insert((id, f.from), copy);
-                }
-                if let Some(before) = self.take_set(id, to, &set, &seen) {
-                    self.spread(id, to, before);
-                } else if let Some(own) = self.segments[&id].sets.get(&to).filter(|s| **s > set) {
-                    let own = own.clone();
-                    let seen = self.segments[&id]
-                        .seen
-                        .get(&to)
-                        .cloned()
-                        .unwrap_or_default();
-                    let copy = self.segments[&id].marks.contains_key(&to);
-                    self.send(to, f.from, Msg::Set(id, own, seen, copy));
-                }
-            }
-            Msg::SegAsk(id) => {
+            Msg::Wish(set) => self.propose_segment(to, Command::Holders(set)),
+            Msg::SegAsk(id, epoch) => {
+                let held = self.hold_epoch(to, id, epoch);
                 if let Some(seg) = self.segments.get(&id) {
-                    let set = seg.sets.get(&to).cloned();
-                    let seen = seg.seen.get(&to).cloned().unwrap_or_default();
                     let mark = seg.marks.get(&to).copied();
                     let known = self.known(to, id);
-                    self.send(to, f.from, Msg::Seg(id, set, seen, mark, known));
+                    self.send(to, f.from, Msg::Seg(id, mark, known, held));
                 }
             }
-            Msg::Seg(id, set, seen, mark, known) => {
-                if !self.segments.contains_key(&id) {
-                    return;
-                }
-                if let Some(set) = set
-                    && let Some(before) = self.take_set(id, to, &set, &seen)
-                {
-                    self.spread(id, to, before);
-                }
+            Msg::Seg(id, mark, known, epoch) => {
                 let Some(seg) = self.segments.get_mut(&id) else {
                     return;
                 };
                 if let (Some(m), Some(own)) = (mark, seg.marks.get_mut(&to)) {
                     *own = (*own).max(m);
                 }
-                let mut answer = seen;
-                answer.insert(0, mark.unwrap_or(0));
+                let answer = Marks::from([(0, mark.unwrap_or(0))]);
                 if let Some(node) = self.nodes.get_mut(&to) {
-                    node.copies.insert((id, f.from), mark.is_some());
                     node.seg_answers.insert((id, f.from), (known, answer, now));
                     if mark.is_some() {
                         node.caught.insert((id, f.from), f.sent);
+                    }
+                    let current = node
+                        .raft
+                        .meta()
+                        .segments
+                        .get(&id)
+                        .filter(|m| m.leader == to && m.leader_epoch == epoch);
+                    if current.is_some() && mark.is_some() {
+                        let lease = node.lease.entry(id).or_default();
+                        if lease.epoch != epoch {
+                            *lease = Lease {
+                                epoch,
+                                ..Lease::default()
+                            };
+                        }
+                        lease.from.insert(f.from);
                     }
                 }
                 let booting = self
                     .nodes
                     .get_mut(&to)
                     .is_some_and(|n| n.booting.remove(&id));
-                if let Some(seg) = self.segments.get_mut(&id)
-                    && booting
-                    && seg.sets.get(&to).is_none_or(|s| !s.holders.contains(&to))
+                let dropped = self
+                    .set_of(to, id)
+                    .is_some_and(|s| !s.holders.contains(&to));
+                if booting
+                    && dropped
+                    && let Some(seg) = self.segments.get_mut(&id)
                 {
                     seg.marks.remove(&to);
                 }
             }
+            Msg::Beat(id, epoch) => {
+                if self.hold_epoch(to, id, epoch) == epoch {
+                    self.send(to, f.from, Msg::Beaten(id, epoch, f.sent));
+                }
+            }
+            Msg::Copied(id, new, mark) => {
+                if [3,4,5].contains(&id) { eprintln!("COPIED {} at={to} seg={id} new={new} own={:?} leads={} meta={:?}", self.now_ms, self.set_of(to,id), self.leads(to,id), self.nodes[&to].raft.meta().segments.get(&id).map(|m| (m.leader, m.leader_epoch, m.holders.holders.clone(), m.holders.epoch))); }
+                let own = self
+                    .set_of(to, id)
+                    .filter(|s| !s.holders.contains(&new))
+                    .cloned();
+                let caught = self
+                    .segments
+                    .get(&id)
+                    .and_then(|s| s.marks.get(&to))
+                    .is_some_and(|m| mark >= *m);
+                if let Some(own) = own
+                    && caught
+                    && self.leads(to, id)
+                {
+                    self.add_holder(to, &own, new);
+                }
+            }
+            Msg::Beaten(id, epoch, sent) => {
+                if let Some(lease) = self
+                    .nodes
+                    .get_mut(&to)
+                    .and_then(|n| n.lease.get_mut(&id))
+                    .filter(|l| l.epoch == epoch)
+                {
+                    let beat = lease.beats.entry(f.from).or_insert(0);
+                    *beat = (*beat).max(sent);
+                }
+            }
             Msg::Drop(id) => {
                 if self.apply_drop(to, id) {
-                    let named: BTreeSet<u64> = self.segments[&id]
-                        .sets
-                        .get(&to)
+                    let named: BTreeSet<u64> = self
+                        .set_of(to, id)
                         .map(|s| s.holders.clone())
                         .unwrap_or_default();
                     let targets = named
@@ -3027,15 +3121,15 @@ impl World {
                 }
                 self.drops_settle();
             }
-            Msg::Acked(sid, copy) => {
+            Msg::Acked(sid, copy, epoch) => {
                 if let Some(s) = self.settles.get_mut(&sid)
                     && s.leader == to
                 {
-                    s.acked.insert(f.from, copy);
+                    s.acked.insert(f.from, copy && epoch == s.epoch);
                 }
             }
             Msg::FenceAsk(id, xs, sent) => {
-                let named = self.segments.get(&id).and_then(|s| s.sets.get(&to));
+                let named = self.set_of(to, id);
                 if self.segments.contains_key(&id)
                     && named.is_none_or(|s| s.holders.contains(&f.from))
                 {
@@ -3190,8 +3284,6 @@ impl World {
         let version = node.raft.meta().version;
         match &rec {
             Rec::Delete(k, stream, upto) => self.apply(to, *k, *stream, *upto),
-            Rec::Groups(g) if to != origin => self.give(to, Some(g.clone())),
-            Rec::Groups(_) => {}
         }
         if to != origin {
             self.send(to, from, Msg::Confirm(id, origin, to, version));
@@ -3301,99 +3393,15 @@ impl World {
                     self.records.push(key);
                     self.done.push((id, origin, now));
                 }
-                Rec::Groups(g) => self.give(origin, Some(g)),
             }
-        }
-    }
-
-    fn ask_picks(&mut self) {
-        let now = self.now_ms;
-        let mut changed = Vec::new();
-        for (c, node) in &self.nodes {
-            for ((id, asker), (last, at, restart, sent)) in &node.answered {
-                let pick = self
-                    .segments
-                    .contains_key(id)
-                    .then(|| self.pick(*c, *id))
-                    .flatten();
-                if now < at + 2 * FENCE_MS && pick != *last {
-                    changed.push((*c, *asker, *id, pick, *restart, *sent));
-                }
-            }
-        }
-        for (c, asker, id, pick, restart, sent) in changed {
-            if let Some(node) = self.nodes.get_mut(&c) {
-                node.answered
-                    .insert((id, asker), (pick, now, restart, sent));
-            }
-            self.lease(c, asker, id, pick);
-            let own = self.disks[&c].restart;
-            self.send(c, asker, Msg::Picked(id, pick, own, restart, sent));
-        }
-        for node in self.nodes.values_mut() {
-            node.answered
-                .retain(|_, (_, at, _, _)| now < *at + 2 * FENCE_MS);
-        }
-        let mut asks = Vec::new();
-        let mut hashes = Vec::new();
-        let ids: Vec<u64> = self.nodes.keys().copied().collect();
-        for n in ids {
-            let node = &self.nodes[&n];
-            let mut peers = BTreeSet::new();
-            let mut wanted = Vec::new();
-            for (id, seg) in &self.segments {
-                let Some(set) = seg.sets.get(&n) else {
-                    continue;
-                };
-                if !seg.marks.contains_key(&n) || self.pick(n, *id) != Some(n) {
-                    continue;
-                }
-                for c in set
-                    .holders
-                    .iter()
-                    .filter(|c| **c != n && self.near(n, **c) && !node.view.absent(**c))
-                {
-                    peers.insert(*c);
-                    wanted.push((*c, *id));
-                }
-            }
-            let inputs: Vec<(u64, Inputs)> =
-                peers.iter().map(|c| (*c, self.inputs(n, *c))).collect();
-            let restart = self.disks[&n].restart;
-            hashes.extend(inputs.iter().map(|(c, i)| (n, *c, i.0, restart)));
-            let view = OnceCell::new();
-            let node = &self.nodes[&n];
-            wanted.retain(|(c, id)| {
-                node.differs.contains(c) || self.same_inputs(n, *c, *id, &view).is_none()
-            });
-            if let Some(node) = self.nodes.get_mut(&n) {
-                node.sent_inputs
-                    .extend(inputs.into_iter().map(|(c, i)| ((c, now), i)));
-            }
-            let node = &self.nodes[&n];
-            wanted.sort_by_key(|(c, id)| node.picked.get(&(*id, *c)).map(|p| p.1));
-            wanted.truncate(PICKS_MAX);
-            asks.extend(wanted.into_iter().map(|(c, id)| (n, c, id, restart)));
-        }
-        for (n, c, hash, restart) in hashes {
-            self.send(n, c, Msg::Inputs(hash, restart, now));
-        }
-        for (n, c, id, restart) in asks {
-            self.send(n, c, Msg::Pick(id, restart, now));
         }
     }
 
     fn prune(&mut self) {
         let now = self.now_ms;
-        let segments = &self.segments;
-        for (n, node) in self.nodes.iter_mut() {
-            node.picked.retain(|_, p| now < p.1 + 2 * FENCE_MS);
-            node.lease.retain(|_, (until, _)| now < *until);
+        for node in self.nodes.values_mut() {
             let view = &node.view;
             node.trips.retain(|d, _| view.entry(*d).is_some());
-            node.same.retain(|_, s| now < s.2 + 2 * FENCE_MS);
-            node.sent_inputs
-                .retain(|(_, sent), _| now < sent + 2 * FENCE_MS);
             node.fence_answers.retain(|_, a| now < a.2 + FENCE_MS);
             node.votes.retain(|_, v| now < v.1 + REPLICATE_MS);
             node.peers.retain(|_, p| now < p.3 + 2 * GOSSIP_MS);
@@ -3402,8 +3410,6 @@ impl World {
             node.seg_answers
                 .retain(|_, a| start.is_some_and(|t| a.2 >= t));
             node.seg_asked.retain(|_, t| now < *t + STEP_MS);
-            node.copies
-                .retain(|(id, _), _| segments.get(id).is_some_and(|s| s.sets.contains_key(n)));
             node.seen_records.retain(|_, t| now < *t + REPLICATE_MS);
         }
     }
@@ -3423,12 +3429,9 @@ impl World {
     }
 
     pub fn held_state(&self, disk: u64) -> usize {
-        self.nodes.get(&disk).map_or(0, |n| {
-            n.picked.len()
-                + n.votes.len()
-                + n.peers.len()
-                + n.seen_records.len()
-        })
+        self.nodes
+            .get(&disk)
+            .map_or(0, |n| n.votes.len() + n.peers.len() + n.seen_records.len())
     }
 
     fn ask_fences(&mut self) {
@@ -3442,7 +3445,7 @@ impl World {
                 .filter(|(id, s)| {
                     node.fences.contains_key(id)
                         || s.marks.contains_key(n)
-                            && s.sets.get(n).is_some_and(|set| {
+                            && self.set_of(*n, **id).is_some_and(|set| {
                                 set.holders.contains(n)
                                     && set.holders.iter().any(|h| h != n && !self.near(*n, *h))
                             })
@@ -3456,7 +3459,7 @@ impl World {
                 .skip(skip)
                 .take(ids.len().min(FENCES_MAX))
             {
-                let Some(set) = self.segments.get(id).and_then(|s| s.sets.get(n)) else {
+                let Some(set) = self.set_of(*n, *id) else {
                     continue;
                 };
                 let co: BTreeSet<u64> = set.holders.iter().copied().filter(|h| h != n).collect();
@@ -3514,8 +3517,18 @@ impl World {
 
     fn applied(&mut self, disk: u64, old: &Saved) {
         let (now, run) = (self.now_ms, self.run_ms);
+        let floor = self.disks[&disk].control.meta.floor;
+        if floor != old.meta.floor {
+            self.floor_applied(disk, old.meta.floor, floor);
+        }
         let control = &self.disks[&disk].control;
-        for entry in control.entries.iter().filter(|e| e.index > old.applied && e.index <= control.applied) {
+        for entry in old
+            .entries
+            .iter()
+            .filter(|e| e.index <= control.snapshot.get_metadata().index)
+            .chain(control.entries.iter())
+            .filter(|e| e.index > old.applied && e.index <= control.applied)
+        {
             let mut h = DefaultHasher::new();
             (entry.term, entry.data.as_ref(), entry.context.as_ref()).hash(&mut h);
             let hash = h.finish();
@@ -3527,6 +3540,32 @@ impl World {
             return;
         }
         self.commit_ms = now;
+        let changed: Vec<(Option<HolderSet>, HolderSet)> = control
+            .meta
+            .segments
+            .values()
+            .filter_map(|s| {
+                let before = old
+                    .meta
+                    .segments
+                    .get(&s.holders.segment)
+                    .map(|b| &b.holders);
+                (before != Some(&s.holders)).then(|| (before.cloned(), s.holders.clone()))
+            })
+            .collect();
+        for (before, set) in changed {
+            let Some(seg) = self.segments.get_mut(&set.segment) else {
+                continue;
+            };
+            if before.is_some_and(|b| b.holders.contains(&disk)) && !set.holders.contains(&disk) {
+                seg.marks.remove(&disk);
+            }
+            if seg.holders.epoch < set.epoch {
+                let from = std::mem::replace(&mut seg.holders, set.clone());
+                self.log(from, set);
+            }
+        }
+        let control = &self.disks[&disk].control;
         let gone: Vec<u64> = old
             .meta
             .members
@@ -3545,26 +3584,39 @@ impl World {
         if !node.raft.is_leader() {
             return;
         }
-        let lost: Vec<u64> = gone.iter().copied().filter(|d| node.lose.contains(d)).collect();
+        let lost = gone.iter().any(|d| node.lose.contains(d));
+        node.lose.retain(|d| !gone.contains(d));
         let drained = gone.iter().any(|d| {
             node.view
                 .entry(*d)
                 .is_some_and(|e| e.body.drained && e.body_key.0 == e.head.restart)
         });
-        if !lost.is_empty() {
-            let reached: Vec<u64> = self
-                .running()
-                .into_iter()
-                .filter(|r| self.link(disk, *r))
-                .collect();
-            self.lower(Cause::AcceptLoss, reached);
+        if lost {
+            node.fall = Some(Cause::AcceptLoss);
         } else if drained {
+            node.fall = Some(Cause::Drain);
             self.drain_commits.push((disk, run));
-            self.lower(Cause::Drain, vec![disk]);
         }
     }
 
     fn govern(&mut self, disk: u64) {
+        let Some(node) = self.nodes.get_mut(&disk) else {
+            return;
+        };
+        if node.raft.is_leader() {
+            let members = &node.raft.meta().members;
+            let removed: Vec<u64> = node
+                .lose
+                .iter()
+                .copied()
+                .filter(|d| !members.contains(d))
+                .collect();
+            node.lose.retain(|d| !removed.contains(d));
+            if !removed.is_empty() {
+                node.fall = Some(Cause::AcceptLoss);
+            }
+        }
+        self.fall(disk);
         let Some(node) = self.nodes.get(&disk) else {
             return;
         };
@@ -3588,18 +3640,58 @@ impl World {
                 )
             })
         };
+        let waiting = view.live().map(|(d, _)| d).any(|d| {
+            let (stop, drained, _) = flags(d);
+            !stop && !drained && (node.raft.learners().contains(&d) || !meta.members.contains(&d))
+        });
+        let drops: Vec<Command> = meta
+            .segments
+            .values()
+            .filter_map(|s| {
+                let kept: BTreeSet<u64> = s
+                    .holders
+                    .holders
+                    .iter()
+                    .copied()
+                    .filter(|h| meta.members.contains(h))
+                    .collect();
+                (!kept.is_empty() && kept.len() < s.holders.holders.len())
+                    .then(|| Command::Holders(s.holders.with(disk, kept)))
+            })
+            .collect();
+        let needed = |m: u64| {
+            meta.segments.iter().any(|(id, s)| {
+                let set: Vec<u64> = s
+                    .holders
+                    .holders
+                    .iter()
+                    .copied()
+                    .filter(|h| meta.members.contains(h))
+                    .collect();
+                let copies = set
+                    .iter()
+                    .filter(|h| {
+                        **h != m
+                            && self.live_reconciled(disk, **h)
+                            && self.segments[id].marks.contains_key(h)
+                    })
+                    .count();
+                set.contains(&m) && !fence::confirmed(copies, set.len())
+            })
+        };
         let remove = meta.members.iter().copied().find(|m| {
             let (stop, drained, remaining) = flags(*m);
             if view.absent(*m) {
                 view.entry(*m).is_some()
-                    && (stop
-                        || drained
+                    && (stop && !needed(*m)
+                        || drained && !needed(*m)
                         || node.lose.contains(m)
+                        || waiting && view.absent_since(*m).is_some_and(|t| run >= t + REPLACE_MS)
                         || view
                             .absent_since(*m)
                             .is_some_and(|t| run >= t + TOMBSTONE_HORIZON))
             } else {
-                stop || drained && remaining == 0
+                (stop || drained && remaining == 0) && !needed(*m)
             }
         });
         let promote = node.raft.learners().iter().copied().find(|l| {
@@ -3617,16 +3709,17 @@ impl World {
             .map(|d| (ConfChangeType::RemoveNode, d))
             .or(promote.map(|d| (ConfChangeType::AddNode, d)))
             .or(add.map(|d| (ConfChangeType::AddLearnerNode, d)));
-        if let Some((kind, member)) = change {
+        if let Some((kind, member)) = change.filter(|_| !node.raft.pending_conf()) {
             self.change(disk, kind, member);
+        }
+        for command in drops {
+            self.propose_segment(disk, command);
         }
     }
 
     fn marks_of(&self, disk: u64, id: u64) -> Marks {
-        let seg = &self.segments[&id];
-        let mut marks = seg.seen.get(&disk).cloned().unwrap_or_default();
-        marks.insert(0, seg.marks.get(&disk).copied().unwrap_or(0));
-        marks
+        let mark = self.segments[&id].marks.get(&disk).copied().unwrap_or(0);
+        Marks::from([(0, mark)])
     }
 
     fn known(&self, disk: u64, id: u64) -> Known {
@@ -3637,10 +3730,11 @@ impl World {
             Known::Copy
         } else if seg.marks.contains_key(&disk)
             || self.copying.contains_key(&(id, disk))
-            || seg
-                .sets
-                .get(&disk)
-                .is_some_and(|s| s.holders.contains(&disk))
+            || self
+                .set_of(disk, id)
+                .unwrap_or(&seg.holders)
+                .holders
+                .contains(&disk)
         {
             Known::Partial
         } else {
@@ -3666,10 +3760,14 @@ impl World {
             return;
         };
         let members = &node.raft.meta().members;
-        let full = !(members.contains(&disk)
-            && (node.raft.is_leader() || node.heard_ms.is_some_and(|t| now < t + HEARD_MS)));
-        node.lose.retain(|d| members.contains(d));
-        if full {
+        let member = members.contains(&disk);
+        let led =
+            |within: u64| node.raft.is_leader() || node.heard_ms.is_some_and(|t| now < t + within);
+        let full = !(member && led(HEARD_MS));
+        if !node.raft.is_leader() {
+            node.lose.retain(|d| members.contains(d));
+        }
+        if !member || !led(2 * HEARD_MS) {
             node.reconciled = false;
         }
         let node = &self.nodes[&disk];
@@ -3687,8 +3785,13 @@ impl World {
             .collect();
         let named: BTreeSet<(u64, u64)> = held
             .iter()
-            .filter_map(|id| self.segments[id].sets.get(&disk).map(|s| (*id, s)))
+            .filter_map(|id| self.set_of(disk, *id).map(|s| (*id, s)))
             .flat_map(|(id, s)| s.holders.iter().map(move |h| (id, *h)))
+            .collect();
+        let unopened: BTreeSet<u64> = held
+            .iter()
+            .copied()
+            .filter(|id| self.set_of(disk, *id).is_none())
             .collect();
         if let Some(node) = self.nodes.get_mut(&disk) {
             node.late
@@ -3697,7 +3800,8 @@ impl World {
                 node.late.entry(*p).or_insert(now);
             }
             if !held.is_empty() {
-                node.named.retain(|k, _| named.contains(k));
+                node.named
+                    .retain(|k, _| named.contains(k) || unopened.contains(&k.0));
                 for k in named {
                     node.named.entry(k).or_insert(now);
                 }
@@ -3712,37 +3816,10 @@ impl World {
             .collect();
         let mut fences = node.fences.clone();
         let mut behind: Vec<u64> = Vec::new();
-        let named: Vec<u64> = if held.is_empty() {
-            Vec::new()
-        } else {
-            self.segments
-                .iter()
-                .filter(|(_, s)| {
-                    s.marks.contains_key(&disk)
-                        || s.sets
-                            .get(&disk)
-                            .is_some_and(|set| set.holders.contains(&disk))
-                })
-                .map(|(id, _)| *id)
-                .collect()
-        };
-        if !named.is_empty() {
-            let skip = (now / GOSSIP_MS) as usize * SETS_MAX % named.len();
-            let window: Vec<u64> = named
-                .iter()
-                .cycle()
-                .skip(skip)
-                .take(named.len().min(SETS_MAX))
-                .copied()
-                .collect();
-            for id in window {
-                self.spread(id, disk, BTreeSet::new());
-            }
-        }
         let node = &self.nodes[&disk];
         let mut lifts = Vec::new();
         for id in held {
-            let Some(set) = self.segments[&id].sets.get(&disk) else {
+            let Some(set) = self.set_of(disk, id) else {
                 continue;
             };
             let unseen = |h: &u64| *h != disk && (stale.contains(h) || !node.trips.contains_key(h));
@@ -3783,7 +3860,16 @@ impl World {
             node.lifts.retain(|k, _| kept.contains(k));
             node.lifts.extend(lifts);
         }
-        for id in behind {
+        let node = &self.nodes[&disk];
+        let unsynced: Vec<u64> = node
+            .raft
+            .meta()
+            .segments
+            .iter()
+            .filter(|(id, m)| m.leader == disk && !synced(node, **id, m))
+            .map(|(id, _)| *id)
+            .collect();
+        for id in behind.into_iter().chain(unsynced) {
             self.catch_up(disk, id);
         }
         let node = &self.nodes[&disk];
@@ -3839,7 +3925,7 @@ impl World {
 
     fn lift_key(&self, disk: u64, id: u64, x: u64) -> Lift {
         let node = &self.nodes[&disk];
-        let set = self.segments[&id].sets.get(&disk).map_or(0, fingerprint);
+        let set = self.set_of(disk, id).map_or(0, fingerprint);
         let view = node.view.entry(x).map(|e| (e.head.restart, e.head.state));
         (node.late.get(&x).copied().unwrap_or(0), view, set)
     }
@@ -3847,7 +3933,7 @@ impl World {
     fn segment_fenced(&self, disk: u64, id: u64, lost: &mut BTreeSet<u64>) -> bool {
         let node = &self.nodes[&disk];
         let (view, list) = (&node.view, node.raft.meta());
-        let Some(set) = self.segments[&id].sets.get(&disk) else {
+        let Some(set) = self.set_of(disk, id) else {
             return false;
         };
         let co: Vec<u64> = set.holders.iter().copied().filter(|h| *h != disk).collect();
@@ -3922,7 +4008,7 @@ impl World {
     fn lifted_of(&self, disk: u64, id: u64, xs: &BTreeSet<u64>) -> BTreeSet<u64> {
         let node = &self.nodes[&disk];
         let seg = &self.segments[&id];
-        let Some(set) = seg.sets.get(&disk) else {
+        let Some(set) = self.set_of(disk, id) else {
             return BTreeSet::new();
         };
         if !seg.marks.contains_key(&disk) || !set.holders.contains(&disk) {
@@ -3952,21 +4038,7 @@ impl World {
             let forgot = d.forgot.entry(origin).or_insert(0);
             *forgot = (*forgot).max(seq);
         }
-        let forgotten: Vec<u64> = d
-            .dropped
-            .iter()
-            .filter(|(_, at)| fence::expired(**at, alive))
-            .map(|(id, _)| *id)
-            .collect();
         d.dropped.retain(|_, at| !fence::expired(*at, alive));
-        for id in forgotten {
-            if let Some(seg) = self.segments.get_mut(&id)
-                && !seg.marks.contains_key(&disk)
-            {
-                seg.sets.remove(&disk);
-                seg.seen.remove(&disk);
-            }
-        }
     }
 
     fn reconcile(&mut self, disk: u64) {
@@ -4006,9 +4078,8 @@ impl World {
         let mut asks = Vec::new();
         for id in &held {
             let own = self.marks_of(disk, *id);
-            let co: Vec<u64> = self.segments[id]
-                .sets
-                .get(&disk)
+            let co: Vec<u64> = self
+                .set_of(disk, *id)
                 .iter()
                 .flat_map(|s| s.holders.iter().copied())
                 .filter(|h| *h != disk && !node.view.absent(*h))
@@ -4135,13 +4206,13 @@ impl World {
             .collect();
         let erased = self.disks[&old].erased.clone();
         let (zone, format_max) = (self.zone(old), self.nodes[&old].format_max);
-        let mut sets = BTreeMap::new();
-        for (id, seg) in self.segments.iter_mut() {
+        let mut sets: BTreeMap<u64, HolderSet> = self
+            .segments
+            .keys()
+            .filter_map(|id| self.set_of(old, *id).map(|set| (*id, set.clone())))
+            .collect();
+        for seg in self.segments.values_mut() {
             seg.marks.remove(&old);
-            let seen = seg.seen.remove(&old).unwrap_or_default();
-            if let Some(set) = seg.sets.remove(&old) {
-                sets.insert(*id, (set, seen));
-            }
         }
         self.down(old);
         self.disks.remove(&old);
@@ -4155,20 +4226,15 @@ impl World {
             {
                 d.erased.insert(id);
             }
-            let (Some(seg), Some((own, seen))) = (self.segments.get_mut(&id), sets.remove(&id))
-            else {
+            let (Some(seg), Some(own)) = (self.segments.get_mut(&id), sets.remove(&id)) else {
                 continue;
             };
             seg.marks.insert(new, mark);
             seg.copied.insert(new, self.now_ms);
-            learn(seg, new, &own, &seen);
             let mut holders = own.holders.clone();
             holders.remove(&old);
             holders.insert(new);
-            let next = own.with(new, holders);
-            let from = seg.holders.clone();
-            self.deliver(new, next.clone());
-            self.log(from, next);
+            self.wish(new, own.with(new, holders));
             self.warnings.insert(id);
         }
         self.wiped.push((old, new));
@@ -4201,13 +4267,11 @@ impl World {
         };
         let to_a = b.view.answer(&a.view.digest());
         let to_b = a.view.answer(&b.view.digest());
-        let (ga, gb) = (a.groups.clone(), b.groups.clone());
-        for (source, target, updates, groups) in [(to, from, to_a, gb), (from, to, to_b, ga)] {
+        for (source, target, updates) in [(to, from, to_a), (from, to, to_b)] {
             if !self.sends(source, target) || self.rng.random_bool(self.drop) {
                 self.missed_gossip += 1;
                 continue;
             }
-            self.give(target, groups);
             let at = self.now_ms + self.rng.random_range(0..=self.delay_ms);
             self.gossip_to(source, target, at, updates);
         }
@@ -4224,12 +4288,6 @@ impl World {
             (from, b.view.answer(&a.view.digest())),
             (to, a.view.answer(&b.view.digest())),
         ];
-        let (ga, gb) = (a.groups.clone(), b.groups.clone());
-        for (target, groups) in [(from, gb), (to, ga)] {
-            if !self.rng.random_bool(self.drop) {
-                self.give(target, groups);
-            }
-        }
         let now = self.now_ms;
         for (target, updates) in replies {
             let run = self.run_of(target);
@@ -4279,23 +4337,17 @@ impl World {
         body.holds = holds;
         body.debt = debt;
         body.count = count;
-        body.floor = node.ctl.floor;
         body.quiet = node.view.quiet(run, QUIET_PERIOD);
         body.domains = hash;
         body.alive_ms = run;
         body.committed = node.ctl.committed;
         body.signals = node.signals;
         node.view.set_body(body, now, run);
-        let from = node.ctl.floor;
-        let merged = node
-            .view
-            .live()
-            .map(|(_, e)| e.body.floor)
-            .fold(from, Floor::max);
         let acts = node.raft.is_leader();
         let (members, version) = (&node.raft.meta().members, node.raft.meta().version);
-        node.ctl.decide(&node.view, members, version, acts, run);
-        let to = node.ctl.floor;
+        let held = node.raft.meta().floor;
+        let decided = node.ctl.decide(&node.view, members, version, acts, run);
+        node.ctl.floor = held;
         let committed = node.ctl.commit(&node.view, members, version, acts, run);
         let member = node.view.durable(node.ctl.count);
         let refused = refuse(committed, node.format_max);
@@ -4308,37 +4360,16 @@ impl World {
                 to: count,
             });
         }
-        let steps = [
-            (from, merged, Cause::Merge),
-            (
-                merged,
-                to,
-                if to.epoch > merged.epoch {
-                    Cause::Quiet
-                } else {
-                    Cause::Rise
-                },
-            ),
-        ];
-        for (from, to, cause) in steps.into_iter().filter(|(from, to, _)| from != to) {
-            let settled = self.run_ms >= self.changed_run_ms + SLACK_MS;
-            let side = self.side(disk);
-            let majority = self.listed(disk);
-            self.floor_changes.push(FloorChange {
-                run_ms: self.run_ms,
-                disk,
-                from,
-                to,
-                cause,
-                debt_ok: self.debt_truth(to.value, &side),
-                majority,
-                counts_ok: !settled || self.counts_ok(&side, to.value),
-            });
+        if let Some(to) = decided.filter(|_| acts) {
+            let cause = if to.epoch > held.epoch {
+                Cause::Quiet
+            } else {
+                Cause::Rise
+            };
+            self.propose_floor(disk, to, cause);
         }
         if let Some(d) = self.disks.get_mut(&disk) {
-            d.floor = to;
             d.member = Some(member);
-            d.groups = self.nodes.get(&disk).and_then(|n| n.groups.clone());
             if !refused {
                 d.committed = committed;
             }

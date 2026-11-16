@@ -158,10 +158,6 @@ pub fn ready(agreed: bool, run_ms_since_start: u64) -> bool {
     agreed || run_ms_since_start >= JOIN_MS
 }
 
-pub fn writer(epoch: u64, reconciled_ring: &[u64]) -> Option<u64> {
-    pick(&[epoch], reconciled_ring.iter().copied())
-}
-
 struct Step<'a> {
     groups: Vec<Vec<u64>>,
     stand_ins: Vec<(usize, u64)>,
@@ -787,34 +783,6 @@ mod tests {
         assert!(g.current(&BTreeSet::from([1, 2, 3, 9])));
         assert!(!g.current(&BTreeSet::from([1, 2, 4])));
         assert!(!g.current(&BTreeSet::new()));
-    }
-
-    #[test]
-    fn no_node_writes_more_than_25_of_100_records_on_10_nodes() {
-        let mut rng = Rng(11);
-        let all: Vec<u64> = (1..=10).map(|i| mix(i) | 1).collect();
-        let mut on: BTreeSet<u64> = all.iter().copied().collect();
-        let mut g: Option<Groups> = None;
-        let mut writes: BTreeMap<u64, u32> = BTreeMap::new();
-        let mut records = 0;
-        while records < 100 {
-            let d = all[rng.below(10) as usize];
-            if !on.remove(&d) {
-                on.insert(d);
-            }
-            let ring: Vec<u64> = on.iter().copied().collect();
-            let epoch = g.as_ref().map_or(0, |g| g.epoch);
-            let Some(by) = writer(epoch, &ring) else {
-                continue;
-            };
-            if let Some(made) = next(g.as_ref(), &ring, &BTreeMap::new(), &BTreeSet::new(), 3) {
-                *writes.entry(by).or_default() += 1;
-                records += 1;
-                g = Some(made);
-            }
-        }
-        let most = writes.values().max().copied().unwrap_or(0);
-        assert!(most <= 25, "{writes:?}");
     }
 
     #[test]

@@ -180,12 +180,6 @@ impl Controller {
         }
     }
 
-    pub fn merge(&mut self, other: Floor) -> bool {
-        let changed = other > self.floor;
-        self.floor = self.floor.max(other);
-        changed
-    }
-
     pub fn decide(
         &mut self,
         view: &View,
@@ -195,9 +189,6 @@ impl Controller {
         run_ms: u64,
     ) -> Option<Floor> {
         let peers: Vec<_> = view.live().map(|(_, e)| &e.body).collect();
-        for body in &peers {
-            self.merge(body.floor);
-        }
         let mut counts: Vec<u8> = peers.iter().map(|b| b.count).collect();
         counts.sort_unstable_by(|a, b| b.cmp(a));
         let risen = counts.get(counts.len() / 2).copied().unwrap_or(0);
@@ -544,15 +535,6 @@ mod tests {
         assert_eq!(ctl.inputs(&view, 3, 0).lambda, PRIOR_LAMBDA);
     }
 
-    #[test]
-    fn the_floor_merges_by_epoch_then_value() {
-        let mut ctl = Controller::new(true, Floor { epoch: 0, value: 5 }, 1);
-        assert!(ctl.merge(Floor { epoch: 1, value: 2 }));
-        assert!(!ctl.merge(Floor { epoch: 0, value: 9 }));
-        assert!(ctl.merge(Floor { epoch: 1, value: 3 }));
-        assert_eq!(ctl.floor, Floor { epoch: 1, value: 3 });
-    }
-
     fn list(members: impl IntoIterator<Item = u64>) -> BTreeSet<u64> {
         members.into_iter().collect()
     }
@@ -574,11 +556,20 @@ mod tests {
         let mut ctl = Controller::new(true, Floor { epoch: 0, value: 4 }, 1);
         ctl.count = 2;
         assert_eq!(ctl.decide(&view, &list(1..=3), 0, true, SAMPLE_MS), None);
-        assert_eq!(ctl.decide(&view, &list(1..=3), 0, true, SAMPLE_MS + 1), None);
-        assert_eq!(ctl.decide(&view, &list(1..=3), 0, true, 3 * SAMPLE_MS), None);
+        assert_eq!(
+            ctl.decide(&view, &list(1..=3), 0, true, SAMPLE_MS + 1),
+            None
+        );
+        assert_eq!(
+            ctl.decide(&view, &list(1..=3), 0, true, 3 * SAMPLE_MS),
+            None
+        );
         ctl.count = 3;
         report(&mut view, &[1, 2, 3], 3, 0);
-        assert_eq!(ctl.decide(&view, &list(1..=3), 0, true, 4 * SAMPLE_MS), None);
+        assert_eq!(
+            ctl.decide(&view, &list(1..=3), 0, true, 4 * SAMPLE_MS),
+            None
+        );
         assert_eq!(
             ctl.decide(&view, &list(1..=3), 0, true, 5 * SAMPLE_MS),
             Some(Floor { epoch: 1, value: 3 })
@@ -785,7 +776,10 @@ mod tests {
         let mut ctl = Controller::new(true, Floor { epoch: 0, value: 3 }, 1);
         ctl.count = 2;
         for at in 1..=3 {
-            assert_eq!(ctl.decide(&view, &list(1..=3), 0, false, at * SAMPLE_MS), None);
+            assert_eq!(
+                ctl.decide(&view, &list(1..=3), 0, false, at * SAMPLE_MS),
+                None
+            );
         }
         assert_eq!(ctl.commit(&view, &list(1..=3), 0, false, SOAK_MS), 1);
         assert_eq!(ctl.commit(&view, &list(1..=6), 0, true, SOAK_MS), 1);

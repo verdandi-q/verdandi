@@ -1,16 +1,20 @@
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
 
-use raft::eraftpb::{ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState, Message};
-use raft::storage::MemStorage;
-use raft::{Config, GetEntriesContext, RawNode, StateRole, Storage};
+use raft::eraftpb::{
+    ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState, Message, Snapshot,
+};
+use raft::util::limit_size;
+use raft::{Config, GetEntriesContext, RaftState, RawNode, StateRole, Storage, StorageError};
 
 use verdandi_core::cluster::controller::{Floor, START};
 use verdandi_core::cluster::placement::{Groups, HolderSet};
 use verdandi_core::cluster::view::take;
 
-const ELECTION_TICK: usize = 10;
-const HEARTBEAT_TICK: usize = 3;
+const ELECTION_TICK: usize = 4;
+const HEARTBEAT_TICK: usize = 1;
+const SNAPSHOT_EVERY: u64 = 1_000;
+const MAX_MESSAGE_BYTES: u64 = 1 << 20;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -180,7 +184,9 @@ impl Meta {
     fn apply(&mut self, command: Command) {
         match command {
             Command::Groups(g) if g.epoch == self.groups.epoch + 1 => self.groups = g,
-            Command::Floor(f) if f.epoch == self.floor.epoch + 1 => self.floor = f,
+            Command::Floor(f) if f > self.floor && f.epoch <= self.floor.epoch + 1 => {
+                self.floor = f
+            }
             Command::Holders(h) => {
                 let current = self.segments.get(&h.segment).map_or(0, |s| s.holders.epoch);
                 if h.epoch != current + 1 {
@@ -207,6 +213,63 @@ impl Meta {
         self.version += 1;
     }
 
+    fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::new();
+        put(&mut out, [self.version]);
+        put_list(&mut out, self.members.iter().copied());
+        let mut commands = vec![
+            Command::Groups(self.groups.clone()),
+            Command::Floor(self.floor),
+        ];
+        for segment in self.segments.values() {
+            commands.push(Command::Holders(segment.holders.clone()));
+            commands.push(Command::Leader {
+                segment: segment.holders.segment,
+                epoch: segment.leader_epoch,
+                disk: segment.leader,
+            });
+        }
+        for command in commands {
+            let bytes = command.encode();
+            out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+            out.extend_from_slice(&bytes);
+        }
+        out
+    }
+
+    fn decode(bytes: &[u8]) -> Option<Meta> {
+        let mut rest = bytes;
+        let [version] = words(&mut rest)?;
+        let mut meta = Meta {
+            members: list(&mut rest)?.into_iter().collect(),
+            version,
+            ..Meta::default()
+        };
+        while !rest.is_empty() {
+            let len = u32::from_le_bytes(take(&mut rest)?) as usize;
+            let (frame, tail) = rest.split_at_checked(len)?;
+            rest = tail;
+            match Command::decode(frame)? {
+                Command::Groups(g) => meta.groups = g,
+                Command::Floor(f) => meta.floor = f,
+                Command::Holders(h) => {
+                    let id = h.segment;
+                    meta.segment(id).holders = h;
+                }
+                Command::Leader {
+                    segment,
+                    epoch,
+                    disk,
+                } => {
+                    let segment = meta.segment(segment);
+                    segment.leader_epoch = epoch;
+                    segment.leader = disk;
+                }
+            }
+        }
+        Some(meta)
+    }
+
     fn segment(&mut self, id: u64) -> &mut Segment {
         self.segments.entry(id).or_insert_with(|| Segment {
             holders: HolderSet {
@@ -224,14 +287,119 @@ impl Meta {
 #[derive(Clone, Default)]
 pub struct Saved {
     pub hard_state: HardState,
+    pub snapshot: Snapshot,
     pub entries: Vec<Entry>,
     pub conf: ConfState,
     pub applied: u64,
     pub meta: Meta,
 }
 
+struct Store {
+    hard_state: HardState,
+    conf: ConfState,
+    snapshot: Snapshot,
+    entries: Vec<Entry>,
+}
+
+impl Store {
+    fn snapshot_index(&self) -> u64 {
+        self.snapshot.get_metadata().index
+    }
+
+    fn last(&self) -> u64 {
+        self.entries
+            .last()
+            .map_or(self.snapshot_index(), |e| e.index)
+    }
+
+    fn append(&mut self, entries: &[Entry]) -> raft::Result<()> {
+        let Some(first) = entries.first() else {
+            return Ok(());
+        };
+        let at = first
+            .index
+            .checked_sub(self.snapshot_index() + 1)
+            .filter(|at| *at as usize <= self.entries.len())
+            .ok_or(raft::Error::Store(StorageError::Unavailable))?;
+        self.entries.truncate(at as usize);
+        self.entries.extend_from_slice(entries);
+        Ok(())
+    }
+
+    fn compact(&mut self, snapshot: Snapshot) {
+        let index = snapshot.get_metadata().index;
+        self.entries.retain(|e| e.index > index);
+        self.snapshot = snapshot;
+    }
+
+    fn install(&mut self, snapshot: Snapshot) {
+        let meta = snapshot.get_metadata();
+        self.hard_state.commit = meta.index;
+        self.hard_state.term = self.hard_state.term.max(meta.term);
+        self.conf = meta.get_conf_state().clone();
+        self.entries.clear();
+        self.snapshot = snapshot;
+    }
+}
+
+impl Storage for Store {
+    fn initial_state(&self) -> raft::Result<RaftState> {
+        Ok(RaftState::new(self.hard_state.clone(), self.conf.clone()))
+    }
+
+    fn entries(
+        &self,
+        low: u64,
+        high: u64,
+        max_size: impl Into<Option<u64>>,
+        _context: GetEntriesContext,
+    ) -> raft::Result<Vec<Entry>> {
+        let offset = self.snapshot_index() + 1;
+        if low < offset {
+            return Err(raft::Error::Store(StorageError::Compacted));
+        }
+        if high > self.last() + 1 {
+            return Err(raft::Error::Store(StorageError::Unavailable));
+        }
+        let mut out = self.entries[(low - offset) as usize..(high - offset) as usize].to_vec();
+        limit_size(&mut out, max_size.into());
+        Ok(out)
+    }
+
+    fn term(&self, idx: u64) -> raft::Result<u64> {
+        let offset = self.snapshot_index() + 1;
+        if idx + 1 == offset {
+            return Ok(self.snapshot.get_metadata().term);
+        }
+        if idx < offset {
+            return Err(raft::Error::Store(StorageError::Compacted));
+        }
+        self.entries
+            .get((idx - offset) as usize)
+            .map(|e| e.term)
+            .ok_or(raft::Error::Store(StorageError::Unavailable))
+    }
+
+    fn first_index(&self) -> raft::Result<u64> {
+        Ok(self.snapshot_index() + 1)
+    }
+
+    fn last_index(&self) -> raft::Result<u64> {
+        Ok(self.last())
+    }
+
+    fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
+        if self.snapshot_index() == 0 || self.snapshot_index() < request_index {
+            return Err(raft::Error::Store(
+                StorageError::SnapshotTemporarilyUnavailable,
+            ));
+        }
+        Ok(self.snapshot.clone())
+    }
+}
+
 pub struct Control {
-    node: RawNode<MemStorage>,
+    node: RawNode<Store>,
     meta: Meta,
     conf: ConfState,
     applied: u64,
@@ -275,6 +443,7 @@ impl Control {
             id,
             Saved {
                 hard_state,
+                snapshot: Snapshot::default(),
                 entries: vec![entry],
                 conf: ConfState::from((vec![id], Vec::new())),
                 applied: 1,
@@ -288,24 +457,32 @@ impl Control {
     }
 
     pub fn restore(id: u64, saved: Saved) -> raft::Result<Control> {
-        let last = saved.entries.last().map_or(0, |e| e.index);
-        let contiguous = saved.entries.iter().zip(1..).all(|(e, i)| e.index == i);
-        if !contiguous || saved.hard_state.commit > last || saved.applied > saved.hard_state.commit
+        let base = saved.snapshot.get_metadata().index;
+        let last = saved.entries.last().map_or(base, |e| e.index);
+        let contiguous = saved
+            .entries
+            .iter()
+            .zip(base + 1..)
+            .all(|(e, i)| e.index == i);
+        if !contiguous
+            || saved.hard_state.commit > last
+            || saved.applied > saved.hard_state.commit
+            || saved.applied < base
         {
             return Err(raft::Error::ConfigInvalid("corrupt saved state".into()));
         }
-        let store = MemStorage::new();
-        {
-            let mut core = store.wl();
-            core.set_hardstate(saved.hard_state);
-            core.set_conf_state(saved.conf.clone());
-            core.append(&saved.entries)?;
-        }
+        let store = Store {
+            hard_state: saved.hard_state,
+            conf: saved.conf.clone(),
+            snapshot: saved.snapshot,
+            entries: saved.entries,
+        };
         let mut config = Config::new(id);
         config.election_tick = ELECTION_TICK;
         config.heartbeat_tick = HEARTBEAT_TICK;
-        config.min_election_tick = ELECTION_TICK;
-        config.max_election_tick = ELECTION_TICK + 1;
+        config.max_size_per_msg = MAX_MESSAGE_BYTES;
+        config.min_election_tick = ELECTION_TICK + (id as usize % ELECTION_TICK);
+        config.max_election_tick = config.min_election_tick + 1;
         config.pre_vote = true;
         config.check_quorum = true;
         config.applied = saved.applied;
@@ -320,16 +497,10 @@ impl Control {
 
     pub fn save(&self) -> raft::Result<Saved> {
         let store = self.node.store();
-        let (first, last) = (store.first_index()?, store.last_index()?);
-        let entries = if last < first {
-            Vec::new()
-        } else {
-            store.entries(first, last + 1, None, GetEntriesContext::empty(false))?
-        };
-        let hard_state = store.rl().hard_state().clone();
         Ok(Saved {
-            hard_state,
-            entries,
+            hard_state: store.hard_state.clone(),
+            snapshot: store.snapshot.clone(),
+            entries: store.entries.clone(),
             conf: self.conf.clone(),
             applied: self.applied,
             meta: self.meta.clone(),
@@ -354,6 +525,10 @@ impl Control {
 
     pub fn learners(&self) -> &[u64] {
         &self.conf.learners
+    }
+
+    pub fn pending_conf(&self) -> bool {
+        self.node.raft.has_pending_conf()
     }
 
     pub fn tick(&mut self) {
@@ -381,22 +556,50 @@ impl Control {
         while self.node.has_ready() {
             let mut ready = self.node.ready();
             out.extend(ready.take_messages());
+            if !ready.snapshot().is_empty() {
+                self.install(ready.snapshot().clone())?;
+            }
             self.apply(ready.take_committed_entries());
-            let store = self.node.store();
-            store.wl().append(ready.entries())?;
+            self.node.mut_store().append(ready.entries())?;
             if let Some(hard_state) = ready.hs() {
-                store.wl().set_hardstate(hard_state.clone());
+                self.node.mut_store().hard_state = hard_state.clone();
             }
             out.extend(ready.take_persisted_messages());
             let mut light = self.node.advance(ready);
             if let Some(commit) = light.commit_index() {
-                self.node.store().wl().mut_hard_state().commit = commit;
+                self.node.mut_store().hard_state.commit = commit;
             }
             out.extend(light.take_messages());
             self.apply(light.take_committed_entries());
             self.node.advance_apply();
+            self.compact()?;
         }
         Ok(out)
+    }
+
+    fn install(&mut self, snapshot: Snapshot) -> raft::Result<()> {
+        let meta = Meta::decode(&snapshot.data)
+            .ok_or_else(|| raft::Error::ConfigInvalid("corrupt snapshot".into()))?;
+        self.meta = meta;
+        self.conf = snapshot.get_metadata().get_conf_state().clone();
+        self.applied = snapshot.get_metadata().index;
+        self.node.mut_store().install(snapshot);
+        Ok(())
+    }
+
+    fn compact(&mut self) -> raft::Result<()> {
+        let store = self.node.store();
+        if self.applied - store.snapshot_index() < SNAPSHOT_EVERY {
+            return Ok(());
+        }
+        let mut snapshot = Snapshot::default();
+        let meta = snapshot.mut_metadata();
+        meta.index = self.applied;
+        meta.term = store.term(self.applied)?;
+        meta.set_conf_state(self.conf.clone());
+        snapshot.data = self.meta.encode().into();
+        self.node.mut_store().compact(snapshot);
+        Ok(())
     }
 
     fn apply(&mut self, entries: Vec<Entry>) {
@@ -488,7 +691,11 @@ mod tests {
     }
 
     fn replay(saved: &Saved) -> Meta {
-        let mut meta = Meta::default();
+        let mut meta = if saved.snapshot.get_metadata().index == 0 {
+            Meta::default()
+        } else {
+            Meta::decode(&saved.snapshot.data).unwrap()
+        };
         for entry in saved.entries.iter().filter(|e| e.index <= saved.applied) {
             match entry.get_entry_type() {
                 EntryType::EntryNormal => {
@@ -770,10 +977,13 @@ mod tests {
                 .values()
                 .filter_map(|s| s.ctl.as_ref().map(applied_log))
                 .collect();
-            let longest = logs.iter().max_by_key(|l| l.len()).unwrap();
-            for log in &logs {
-                assert!(
-                    longest.starts_with(log),
+            let mut agreed = BTreeMap::new();
+            for (index, term, data, context) in logs.into_iter().flatten() {
+                assert_eq!(
+                    *agreed
+                        .entry(index)
+                        .or_insert((term, data.clone(), context.clone())),
+                    (term, data, context),
                     "seed {}: applied logs diverge",
                     self.seed
                 );
@@ -785,7 +995,7 @@ mod tests {
             self.run(quiet);
             assert!(!self.acked.is_empty(), "seed {}: nothing acked", self.seed);
             assert!(
-                self.leader().is_some(),
+                self.until(100, |s| s.leader().is_some()),
                 "seed {}: no leader at the end",
                 self.seed
             );
@@ -932,6 +1142,62 @@ mod tests {
         assert_eq!(sim.nodes[&2].ctl.as_ref().unwrap().meta, before);
         sim.check_final(200);
         assert_eq!(sim.metas()[0].segments.len(), 30);
+    }
+
+    #[test]
+    fn a_follower_cut_during_many_commands_catches_up_from_a_snapshot() {
+        let mut sim = Sim::cluster(66, 3);
+        let follower = (1..=3).find(|id| Some(*id) != sim.leader()).unwrap();
+        sim.side.insert(follower, 1);
+        for _ in 0..2500 {
+            sim.commit_one();
+        }
+        let leader = sim.leader().unwrap();
+        assert!(
+            sim.nodes[&leader]
+                .ctl
+                .as_ref()
+                .unwrap()
+                .node
+                .store()
+                .first_index()
+                .unwrap()
+                > 1
+        );
+        sim.heal();
+        assert!(sim.until(2000, |s| {
+            s.nodes[&follower].ctl.as_ref().unwrap().meta.segments.len() == 2500
+        }));
+        sim.check_final(100);
+        let leader = sim.leader().unwrap();
+        let lead = &sim.nodes[&leader].ctl.as_ref().unwrap().meta;
+        let caught = &sim.nodes[&follower].ctl.as_ref().unwrap().meta;
+        assert_eq!(caught, lead);
+        assert!(
+            sim.nodes[&follower]
+                .ctl
+                .as_ref()
+                .unwrap()
+                .node
+                .store()
+                .snapshot_index()
+                > 0
+        );
+    }
+
+    #[test]
+    fn a_node_saved_and_restored_after_many_commands_has_the_same_meta() {
+        let mut ctl = solo();
+        for segment in 1..=2500 {
+            ctl.propose(&holders(segment, 1)).unwrap();
+            ctl.drain().unwrap();
+        }
+        let saved = ctl.save().unwrap();
+        assert!(saved.snapshot.get_metadata().index > 0);
+        assert!(saved.entries.len() < 1000);
+        let restored = Control::restore(1, saved).unwrap();
+        assert_eq!(restored.meta, ctl.meta);
+        assert_eq!(restored.meta.segments.len(), 2500);
     }
 
     #[test]

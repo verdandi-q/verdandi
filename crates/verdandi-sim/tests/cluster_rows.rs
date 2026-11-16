@@ -436,11 +436,12 @@ fn e19_rise_and_fall(count: u64) {
 #[test]
 fn a_repair_copies_the_mark_of_its_source() {
     let mut world = World::new(1);
-    let nodes = world.start(3, 3, OLD);
-    world.place(&nodes, SEGMENT_BYTES);
+    let nodes = world.start(5, 3, OLD);
+    let id = world.place(&nodes[..3], SEGMENT_BYTES);
+    world.held_repair.insert(id);
     warm(&mut world);
     world.kill(nodes[2]);
-    world.advance(5_000);
+    world.advance(8_000);
     world.settle();
     world.advance(1_000);
     world.kill(nodes[0]);
@@ -449,14 +450,13 @@ fn a_repair_copies_the_mark_of_its_source() {
     world.advance(5_000);
     assert!(world.accept_loss(nodes[0]));
     assert!(world.accept_loss(nodes[1]));
-    let receiver = world.create("a", OLD, 1);
+    world.held_repair.remove(&id);
     world.advance(30_000);
-    assert!(
-        world
-            .segments
-            .values()
-            .all(|s| s.marks.contains_key(&receiver))
-    );
+    assert!(world.segments.values().all(|s| {
+        s.marks
+            .iter()
+            .any(|(d, m)| *d != nodes[2] && *m == s.marks[&nodes[2]])
+    }));
     assert_eq!(world.lost_settles(), 1);
     world.delete(nodes[0]);
     world.delete(nodes[1]);
@@ -651,7 +651,10 @@ fn a_copy_that_no_holder_set_names_does_not_count() {
         assert!(!w.segments[&id].holders.holders.contains(&x), "seed {seed}");
         assert!(w.boot(x, 1));
         assert!(w.settle_repair(SETTLE_MS), "seed {seed}");
-        for d in &group {
+        let mut gone = w.segments[&id].holders.holders.clone();
+        gone.extend(group.iter().copied());
+        gone.remove(&x);
+        for d in &gone {
             w.delete(*d);
         }
         assert!(!w.segments[&id].marks.contains_key(&x), "seed {seed}");
@@ -735,6 +738,7 @@ fn the_repair_check_scans_every_segment() {
         w.place(&group, 1);
     }
     w.place(&group[..2], 1);
+    w.advance(5_000);
     assert!(!w.repaired());
 }
 
@@ -1316,7 +1320,7 @@ fn row10_remove_three_of_six_within_five_seconds_at_1000_seeds() {
 }
 
 fn some_stream_deleted(w: &mut World) {
-    for _ in 0..20 {
+    for _ in 0..ELECTION_MS / STEP_MS {
         let stream = w.rng.random_range(0..3);
         if w.delete_stream_wait(stream) {
             return;
@@ -1327,7 +1331,7 @@ fn some_stream_deleted(w: &mut World) {
 }
 
 fn dropped(w: &mut World, id: u64) {
-    for _ in 0..20 {
+    for _ in 0..ELECTION_MS / STEP_MS {
         if w.drop_segment(id) {
             return;
         }
@@ -1444,7 +1448,7 @@ fn delete_and_drop_held(w: &mut World, x: u64, seed: u64) {
     let held = held_by(w, x);
     let first = held[0];
     let stream = w.segments[&first].stream;
-    for _ in 0..20 {
+    for _ in 0..ELECTION_MS / STEP_MS {
         if w.delete_stream_wait(stream) {
             break;
         }
@@ -1555,7 +1559,7 @@ fn away(seed: u64) -> Away {
     }
     w.advance(10_000);
     let stream = (w.segments[&last].stream + 1) % 3;
-    for _ in 0..20 {
+    for _ in 0..ELECTION_MS / STEP_MS {
         if w.delete_stream_wait(stream) {
             break;
         }
@@ -1606,7 +1610,7 @@ fn row16_away_longer_than_the_horizon_at_1000_seeds() {
     row16(LONG_SEEDS);
 }
 
-const ELECTION_MS: u64 = 22_500;
+const ELECTION_MS: u64 = 25_000;
 const STALL_MS: u64 = 15_000 + ELECTION_MS;
 
 fn settled(w: &mut World, seed: u64) {
@@ -1675,10 +1679,10 @@ fn cut_run(seed: u64, loss: f64, restarts: f64, bound: u64) -> (u64, u64) {
     }
     w.cuts.clear();
     let mut stuck: Option<BTreeSet<(u64, u64)>> = None;
-    for step in 0..30_000 / STEP_MS {
+    for step in 0..(30_000 + ELECTION_MS) / STEP_MS {
         busy(&mut w);
         w.advance(STEP_MS);
-        if step >= 20_000 / STEP_MS {
+        if step >= (20_000 + ELECTION_MS) / STEP_MS {
             let (unled, unreconciled) = w.stalls();
             let now: BTreeSet<(u64, u64)> = unled
                 .into_iter()
@@ -1707,8 +1711,8 @@ fn cut_run(seed: u64, loss: f64, restarts: f64, bound: u64) -> (u64, u64) {
     w.held_repair.extend(ids);
     w.advance(repair::DIGEST_MS + 2_000);
     for (id, s) in &w.segments {
-        for (h, set) in &s.sets {
-            if s.marks.contains_key(h) && set.holders.contains(h) {
+        for h in s.marks.keys() {
+            if let Some(set) = w.set_of(*h, *id).filter(|set| set.holders.contains(h)) {
                 assert_eq!(set, &s.holders, "seed {seed}: segment {id} on {h}");
             }
         }
@@ -1835,11 +1839,14 @@ fn a_planned_holder_with_no_live_complete_copy_names_the_segment_lost() {
 fn spanning(w: &World, minority: &[u64], majority: &[u64]) -> BTreeSet<u64> {
     w.segments
         .iter()
-        .filter(|(_, s)| {
-            minority.iter().filter_map(|m| s.sets.get(m)).any(|set| {
-                set.holders.iter().any(|h| minority.contains(h))
-                    && set.holders.iter().any(|h| majority.contains(h))
-            })
+        .filter(|(id, _)| {
+            minority
+                .iter()
+                .filter_map(|m| w.set_of(*m, **id))
+                .any(|set| {
+                    set.holders.iter().any(|h| minority.contains(h))
+                        && set.holders.iter().any(|h| majority.contains(h))
+                })
         })
         .map(|(id, _)| *id)
         .collect()
@@ -1871,7 +1878,7 @@ fn a_holder_set_that_spans_a_cut_stays_spanning_on_the_minority_side_until_the_h
         for (id, s) in &w.segments {
             for h in s.marks.keys() {
                 assert_eq!(
-                    s.sets.get(h),
+                    w.set_of(*h, *id),
                     Some(&s.holders),
                     "seed {seed} segment {id} holder {h}"
                 );
@@ -2271,30 +2278,6 @@ fn members_a_request_of_an_earlier_run_gets_no_200() {
 }
 
 #[test]
-fn members_picks_go_per_segment_only_while_the_inputs_differ() {
-    let mut w = World::new(1);
-    let n = w.start(3, 3, OLD);
-    for _ in 0..200 {
-        w.place(&n, SEGMENT_BYTES);
-    }
-    warm(&mut w);
-    let before = w.pick_frames;
-    w.advance(10_000);
-    assert_eq!(w.pick_frames, before, "a Pick while the inputs agree");
-    for id in w.acked.clone() {
-        assert_eq!(w.leaders(id).len(), 1, "segment {id}");
-    }
-    w.kill(n[0]);
-    let mut most = 0;
-    for _ in 0..40 {
-        let before = w.pick_frames;
-        w.advance(STEP_MS);
-        most = most.max(w.pick_frames - before);
-    }
-    assert!(most <= 2 * 64, "{most} Picks in one step");
-}
-
-#[test]
 fn members_a_settle_with_one_live_copy_gets_no_200() {
     for seed in 0..10 {
         let mut w = World::new(seed);
@@ -2535,7 +2518,7 @@ fn cuts_seeds_104_and_330_keep_a_leader_for_each_segment() {
 }
 
 const CUTS_LOSS_BOUND_MS: u64 = 55_000;
-const CUTS_RESTARTS_BOUND_MS: u64 = 22_000;
+const CUTS_RESTARTS_BOUND_MS: u64 = 22_000 + ELECTION_MS;
 
 fn cuts_with(count: u64, name: &str, loss: f64, restarts: f64, bound: u64) {
     let runs = seeds(count, |seed| cut_run(seed, loss, restarts, bound));
@@ -2685,17 +2668,14 @@ fn members_a_drop_reaches_each_holder_by_frames_and_an_absent_holder_on_return()
 }
 
 #[test]
-fn members_set_frames_go_on_a_change_and_segment_asks_are_capped() {
+fn members_segment_asks_are_capped() {
     let mut w = World::new(1);
     let n = w.start(3, 3, OLD);
     for _ in 0..300 {
         w.place(&n, SEGMENT_BYTES);
     }
     warm(&mut w);
-    let before = w.set_frames;
     w.advance(10_000);
-    let sets = w.set_frames - before;
-    assert!(sets <= 10 * 3 * 2 * 64, "{sets} Set frames in 10 s");
     w.kill(n[0]);
     assert!(w.boot(n[0], 1));
     let mut most = 0;
@@ -2848,7 +2828,8 @@ fn two_stale_holders_of_five_lift_no_fence_for_each_other() {
 }
 
 #[test]
-fn a_lone_holder_that_took_a_settle_after_a_holder_died_leads_while_the_dead_holder_stays_listed() {
+fn a_lone_holder_that_took_a_settle_after_a_holder_died_does_not_lead_while_the_dead_holder_stays_listed()
+ {
     for seed in 0..5 {
         let mut w = World::new(seed);
         let n = w.start(5, 3, OLD);
@@ -2869,14 +2850,12 @@ fn a_lone_holder_that_took_a_settle_after_a_holder_died_leads_while_the_dead_hol
         assert!(w.accept_loss(b), "seed {seed}");
         w.advance(5_000);
         w.kill(x);
-        let mut waited = 0;
-        while w.leaders(id) != [a] && waited < STALL_MS {
+        for _ in 0..STALL_MS / STEP_MS {
             w.take();
             w.advance(STEP_MS);
-            waited += STEP_MS;
         }
         assert!(w.in_list(x), "seed {seed}: the dead holder left the list");
-        assert_eq!(w.leaders(id), [a], "seed {seed}: no leader in {waited} ms");
+        assert!(w.leaders(id).is_empty(), "seed {seed}: a lone holder led");
         assert_eq!(w.redelivered, 0, "seed {seed}: redelivered after 200");
     }
 }
@@ -2898,23 +2877,18 @@ fn a_settle_on_two_of_four_holders_gets_no_200_after_the_other_two_are_accepted_
         warm(&mut w);
         w.kill(n[2]);
         w.kill(n[3]);
-        w.advance(10_000);
-        assert!(w.accept_loss(n[2]), "seed {seed}");
-        w.advance(10_000);
-        assert!(w.accept_loss(n[3]), "seed {seed}");
-        w.advance(10_000);
-        let mut led = false;
-        for _ in 0..10_000 / STEP_MS {
-            led |= !w.leaders(id).is_empty();
+        for _ in 0..30_000 / STEP_MS {
             w.settle();
             w.take();
             w.advance(STEP_MS);
         }
-        assert!(led, "seed {seed}: no leader");
         assert!(
             !w.settled.contains_key(&id),
             "seed {seed}: a 200 on two of four holders"
         );
+        assert!(w.accept_loss(n[2]), "seed {seed}");
+        w.advance(10_000);
+        assert!(w.accept_loss(n[3]), "seed {seed}");
     }
 }
 
@@ -2986,7 +2960,10 @@ fn version_of(w: &World) -> u64 {
 }
 
 fn one_voice(w: &World, seed: u64) {
-    assert_eq!(w.two_lists, 0, "seed {seed}: two nodes applied different commands at one index");
+    assert_eq!(
+        w.two_lists, 0,
+        "seed {seed}: two nodes applied different commands at one index"
+    );
     assert_eq!(w.double_leaders, 0, "seed {seed}: two leaders");
 }
 
@@ -2996,20 +2973,59 @@ fn a_join_through_a_cut_minority_never_commits_and_the_joiner_joins_after_the_he
         let mut w = World::new(seed);
         let n = w.start(5, 3, OLD);
         warm(&mut w);
-        let (members, version) = (members_of(&w), version_of(&w));
+        let members = members_of(&w);
         let joiner = w.create("a", 0, 1);
-        w.part(&[n[0], n[1], joiner]);
+        let cut = [n[0], n[1], joiner];
+        let versions = cut.map(|d| w.meta(d).map_or(0, |m| m.version));
+        w.part(&cut);
         for _ in 0..60_000 / STEP_MS {
-            assert!(!w.in_list(joiner), "seed {seed}: the cut minority admitted a joiner");
+            assert!(
+                !w.in_list(joiner),
+                "seed {seed}: the cut minority admitted a joiner"
+            );
             assert_eq!(members_of(&w), members, "seed {seed}");
             w.advance(STEP_MS);
         }
-        assert_eq!(version_of(&w), version, "seed {seed}: the cut minority committed");
+        assert_eq!(
+            cut.map(|d| w.meta(d).map_or(0, |m| m.version)),
+            versions,
+            "seed {seed}: the cut minority committed"
+        );
         w.heal();
         w.advance(90_000);
-        assert!(w.in_list(joiner), "seed {seed}: the joiner did not join after the heal");
-        assert!(w.joined(joiner), "seed {seed}: the joiner did not reconcile");
+        assert!(
+            w.in_list(joiner),
+            "seed {seed}: the joiner did not join after the heal"
+        );
+        assert!(
+            w.joined(joiner),
+            "seed {seed}: the joiner did not reconcile"
+        );
         one_voice(&w, seed);
+    }
+}
+
+#[test]
+fn a_short_cut_with_a_joiner_waiting_does_not_remove_the_cut_member() {
+    for seed in 0..5 {
+        let mut w = World::new(seed);
+        let n = w.start(3, 3, OLD);
+        warm(&mut w);
+        w.part(&[n[0]]);
+        w.create("a", 0, 1);
+        for _ in 0..20_000 / STEP_MS {
+            w.advance(STEP_MS);
+            assert!(
+                members_of(&w).contains(&n[0]),
+                "seed {seed}: the cut member left the list"
+            );
+        }
+        w.heal();
+        w.advance(90_000);
+        assert!(
+            members_of(&w).contains(&n[0]),
+            "seed {seed}: the cut member left the list"
+        );
     }
 }
 
@@ -3037,7 +3053,11 @@ fn a_scale_in_of_half_by_sigterm_removes_one_member_at_a_time_and_loses_nothing(
             before = now;
             w.advance(STEP_MS);
         }
-        assert_eq!(members_of(&w), BTreeSet::from([n[0], n[1], n[2]]), "seed {seed}");
+        assert_eq!(
+            members_of(&w),
+            BTreeSet::from([n[0], n[1], n[2]]),
+            "seed {seed}"
+        );
         assert!(w.settle_repair(SETTLE_MS), "seed {seed}: no repair");
         intact(&w, seed);
         one_voice(&w, seed);
@@ -3059,9 +3079,17 @@ fn a_drain_then_the_removal_loses_nothing() {
             }
             w.advance(STEP_MS);
         }
-        assert_eq!(members_of(&w), BTreeSet::from([n[0], n[1], n[2], n[3]]), "seed {seed}");
+        assert_eq!(
+            members_of(&w),
+            BTreeSet::from([n[0], n[1], n[2], n[3]]),
+            "seed {seed}"
+        );
         assert!(w.settle_repair(SETTLE_MS), "seed {seed}: no repair");
-        assert!(w.illegal_falls().is_empty(), "seed {seed}: {:?}", w.illegal_falls());
+        assert!(
+            w.illegal_falls().is_empty(),
+            "seed {seed}: {:?}",
+            w.illegal_falls()
+        );
         intact(&w, seed);
         one_voice(&w, seed);
     }
@@ -3083,7 +3111,11 @@ fn an_accept_loss_of_two_dead_members_of_five_commits_and_the_floor_falls_by_acc
         w.advance(60_000);
         assert!(w.accept_loss(n[3]) && w.accept_loss(n[4]), "seed {seed}");
         w.advance(60_000);
-        assert_eq!(members_of(&w), BTreeSet::from([n[0], n[1], n[2]]), "seed {seed}");
+        assert_eq!(
+            members_of(&w),
+            BTreeSet::from([n[0], n[1], n[2]]),
+            "seed {seed}"
+        );
         let falls: Vec<Cause> = w
             .floor_changes
             .iter()
@@ -3091,10 +3123,16 @@ fn an_accept_loss_of_two_dead_members_of_five_commits_and_the_floor_falls_by_acc
             .map(|c| c.cause)
             .collect();
         assert!(
-            falls.iter().all(|c| matches!(c, Cause::AcceptLoss | Cause::Merge)),
+            falls
+                .iter()
+                .all(|c| matches!(c, Cause::AcceptLoss | Cause::Merge)),
             "seed {seed}: {falls:?}"
         );
-        assert!(w.illegal_falls().is_empty(), "seed {seed}: {:?}", w.illegal_falls());
+        assert!(
+            w.illegal_falls().is_empty(),
+            "seed {seed}: {:?}",
+            w.illegal_falls()
+        );
         assert_eq!(w.lost(), 0, "seed {seed}");
         one_voice(&w, seed);
     }
@@ -3114,7 +3152,10 @@ fn a_restart_of_the_leader_during_a_conf_change_gives_one_member_set_on_every_no
             }
             w.advance(STEP_MS);
         }
-        assert!(!w.in_list(joiner), "seed {seed}: the change finished before the restart");
+        assert!(
+            !w.in_list(joiner),
+            "seed {seed}: the change finished before the restart"
+        );
         let leader = w.raft_leader().expect("a leader");
         w.kill(leader);
         w.advance(10_000);
@@ -3122,7 +3163,11 @@ fn a_restart_of_the_leader_during_a_conf_change_gives_one_member_set_on_every_no
         w.advance(120_000);
         let want: BTreeSet<u64> = n.iter().copied().chain([joiner]).collect();
         for d in w.running() {
-            assert_eq!(w.meta(d).map(|m| &m.members), Some(&want), "seed {seed}: node {d}");
+            assert_eq!(
+                w.meta(d).map(|m| &m.members),
+                Some(&want),
+                "seed {seed}: node {d}"
+            );
         }
         one_voice(&w, seed);
     }
@@ -3145,7 +3190,42 @@ fn an_even_cut_of_four_commits_on_neither_side() {
         assert_eq!(w.raft_leader(), None, "seed {seed}: a side kept a leader");
         w.heal();
         w.advance(120_000);
-        assert!(joiners.iter().all(|j| w.in_list(*j)), "seed {seed}: a joiner did not join after the heal");
+        assert!(
+            joiners.iter().all(|j| w.in_list(*j)),
+            "seed {seed}: a joiner did not join after the heal"
+        );
         one_voice(&w, seed);
     }
+}
+
+#[test]
+#[ignore]
+fn raft_election_time_after_a_leader_kill() {
+    let mut times = Vec::new();
+    for seed in 0..40 {
+        let mut w = World::new(seed);
+        w.start(5, 3, OLD);
+        warm(&mut w);
+        for _ in 0..5 {
+            let leader = w.raft_leader().expect("a leader");
+            w.kill(leader);
+            let mut ms = 0;
+            while w.raft_leader().is_none() && ms < 120_000 {
+                w.advance(STEP_MS);
+                ms += STEP_MS;
+            }
+            times.push(ms);
+            w.boot(leader, 1);
+            w.advance(60_000);
+        }
+    }
+    times.sort_unstable();
+    let at = |p: usize| times[(times.len() * p / 100).min(times.len() - 1)];
+    println!(
+        "ELECTION n={} p50={} p99={} max={}",
+        times.len(),
+        at(50),
+        at(99),
+        times[times.len() - 1]
+    );
 }

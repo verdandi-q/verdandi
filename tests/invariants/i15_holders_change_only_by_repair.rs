@@ -63,13 +63,14 @@ fn i15_holders_change_only_by_repair() {
         assert!(w.settle_repair(1_800_000), "seed {seed}: no repair");
         justified(&w, &before, 0, seed);
         let held = sets(&w);
-        let mark = w.holder_changes.len();
         w.held_repair = held.keys().copied().collect();
         w.create("a", OLD, 1);
         w.advance(60_000);
         w.stop(nodes[1]);
         w.advance(120_000);
         assert!(!w.running().contains(&nodes[1]), "seed {seed}");
+        let held = sets(&w);
+        let mark = w.holder_changes.len();
         let floors = w.floor_changes.len();
         w.kill(nodes[2]);
         w.advance(20_000);
@@ -79,6 +80,8 @@ fn i15_holders_change_only_by_repair() {
         assert_eq!(w.holder_changes.len(), mark, "seed {seed}");
         assert_eq!(sets(&w), held, "seed {seed}");
         w.held_repair.clear();
+        assert!(w.boot(nodes[2], 1), "seed {seed}");
+        assert!(w.boot(nodes[3], 1), "seed {seed}");
         assert!(w.settle_repair(1_800_000), "seed {seed}: no repair");
         assert!(
             w.holder_changes.len() > mark,
