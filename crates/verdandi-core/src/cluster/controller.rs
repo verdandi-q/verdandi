@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 
-use super::fence::confirmed;
 use super::view::{SAMPLE_MS, View};
 
 pub const QUIET_PERIOD: u64 = 6 * 3_600_000;
@@ -113,6 +112,10 @@ pub fn gate(record_size: u8, in_force_size: u8) -> Gate {
 
 pub fn refuse(committed: u16, format_max: u16) -> bool {
     committed > format_max
+}
+
+pub fn confirmed(votes: usize, set: usize) -> bool {
+    2 * votes > set
 }
 
 fn at_epoch(view: &View, members: &BTreeSet<u64>, version: u64) -> bool {

@@ -19,21 +19,25 @@ pub const LIFECYCLE: u8 = 8;
 const LOSS_SIGNALS: u8 = SPOT | REBALANCE | LIFECYCLE;
 const BODY_FOLLOWS: u8 = 0x80;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub enum State {
     Alive,
     Dead,
     Left,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct Head {
     pub restart: u64,
     pub heartbeat: u64,
     pub state: State,
 }
 
-#[derive(Clone, Debug, Default, PartialEq)]
+#[derive(Clone, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Body {
     pub address: String,
     pub join_ms: u64,
@@ -58,6 +62,7 @@ pub struct Body {
     pub domains: u64,
     pub quiet: bool,
     pub reconciled: bool,
+    pub marks: BTreeSet<u64>,
     pub unreachable: Vec<u64>,
     pub signals: u8,
     pub remaining: u32,
@@ -79,7 +84,7 @@ pub struct Line {
     pub version: u32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct Update {
     pub disk: u64,
     pub head: Head,
@@ -177,6 +182,10 @@ impl View {
         &self.members[&self.me].entry
     }
 
+    pub fn latest(&self) -> &Body {
+        self.pending.as_ref().unwrap_or(&self.own().body)
+    }
+
     pub fn entry(&self, disk: u64) -> Option<&Entry> {
         self.members.get(&disk).map(|m| &m.entry)
     }
@@ -185,6 +194,10 @@ impl View {
         self.members
             .get(&disk)
             .is_none_or(|m| m.entry.head.state != State::Alive)
+    }
+
+    pub fn known(&self) -> impl Iterator<Item = u64> + '_ {
+        self.members.keys().copied()
     }
 
     pub fn live(&self) -> impl Iterator<Item = (u64, &Entry)> {
@@ -380,6 +393,7 @@ impl View {
         }
         let urgent = own.signals != body.signals
             || own.reconciled != body.reconciled
+            || own.marks != body.marks
             || own.unreachable != body.unreachable;
         self.pending = Some(body);
         if urgent || now_ms >= self.body_ms + SAMPLE_MS {

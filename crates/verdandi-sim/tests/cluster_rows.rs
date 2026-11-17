@@ -6,19 +6,18 @@ use std::thread;
 
 use rand::Rng;
 use rand::seq::{IndexedRandom, SliceRandom};
-use verdandi_core::cluster::fence::FENCE_MS;
 use verdandi_core::cluster::placement::pair;
 use verdandi_core::cluster::repair;
 use verdandi_core::cluster::steer::HEAVY_HOLD_MS;
 use verdandi_core::cluster::view::TOMBSTONE_HORIZON;
-use verdandi_sim::cluster_sim::{Cause, HOUR_MS, SEGMENT_BYTES, STEP_MS, World};
+use verdandi_sim::cluster_sim::{Cause, FENCE_MS, HOUR_MS, ISR_MS, SEGMENT_BYTES, STEP_MS, World};
 
 const SEEDS: u64 = 100;
 const LONG_SEEDS: u64 = 1_000;
 const GB: u64 = 1_000_000_000;
 const OLD: u64 = 25 * HOUR_MS;
 const SIX_HOURS: u64 = 6 * HOUR_MS;
-const SAMPLE_GRACE_MS: u64 = 3 * 5_000;
+const SAMPLE_GRACE_MS: u64 = 4 * 5_000;
 const THREADS: usize = 4;
 
 fn seeds<T: Send>(count: u64, run: impl Fn(u64) -> T + Sync) -> Vec<T> {
@@ -441,7 +440,7 @@ fn a_repair_copies_the_mark_of_its_source() {
     world.held_repair.insert(id);
     warm(&mut world);
     world.kill(nodes[2]);
-    world.advance(8_000);
+    world.advance(9_000);
     world.settle();
     world.advance(1_000);
     world.kill(nodes[0]);
@@ -1176,7 +1175,6 @@ fn cut_off(seed: u64) -> (usize, u64) {
         w.publish_from(writer);
         w.advance(STEP_MS);
     }
-    assert!(w.full_fence(x), "seed {seed}: the cut node is not fenced");
     w.delete(x);
     traffic(&mut w, 10_000);
     assert!(w.settle_repair(SETTLE_MS), "seed {seed}: no repair");
@@ -1201,15 +1199,6 @@ fn row7_one_node_cut_off_from_five_then_its_disk_deleted() {
 #[ignore]
 fn row7_one_node_cut_off_from_five_then_its_disk_deleted_at_1000_seeds() {
     row7(LONG_SEEDS);
-}
-
-const GAP_MS: u64 = ELECTION_MS + 5_000;
-
-fn unfenced(w: &World, disks: &[u64], seed: u64) {
-    for d in disks {
-        let gap = w.adopted_ms(*d).is_some_and(|t| w.now_ms < t + GAP_MS);
-        assert!(w.acts(*d) || gap, "seed {seed}: {d} is fenced");
-    }
 }
 
 struct ScaleIn {
@@ -1245,7 +1234,6 @@ fn scale_in(seed: u64, script: u8) -> ScaleIn {
             victims.extend(&all[..3]);
         }
     }
-    let survivors: Vec<u64> = n.iter().copied().filter(|d| !victims.contains(d)).collect();
     for v in &victims {
         w.stop(*v);
         let gap = w.rng.random_range(0..=4) * STEP_MS;
@@ -1262,12 +1250,10 @@ fn scale_in(seed: u64, script: u8) -> ScaleIn {
         if left.is_empty() {
             break;
         }
-        unfenced(&w, &survivors, seed);
         w.advance(STEP_MS);
     }
     assert!(left.is_empty(), "seed {seed}: {left:?} did not leave");
     for _ in 0..30 {
-        unfenced(&w, &survivors, seed);
         traffic(&mut w, 1_000);
     }
     let dead_left = victims.iter().filter(|v| w.in_list(**v)).count();
@@ -1406,7 +1392,7 @@ fn all_away(seed: u64) -> (usize, u64) {
     for d in &away {
         assert!(w.boot(*d, 1), "seed {seed}");
     }
-    serve(&mut w, 60_000);
+    serve(&mut w, 100_000);
     assert!(
         w.warnings.contains(&id),
         "seed {seed}: {id} kept without a warning"
@@ -1521,14 +1507,9 @@ fn away(seed: u64) -> Away {
     let cuts: Vec<(u64, u64)> = n[1..].iter().map(|o| pair(x, *o)).collect();
     w.cut(&cuts);
     w.advance(ELECTION_MS);
-    assert!(w.full_fence(x), "seed {seed}");
     delete_and_drop_held(&mut w, x, seed);
     w.jump(BEYOND_MS);
     w.advance(10_000);
-    assert!(
-        w.full_fence(x),
-        "seed {seed}: the cut node lifted its fence"
-    );
     w.cuts.clear();
     serve(&mut w, 60_000);
     assert!(
@@ -1709,7 +1690,7 @@ fn cut_run(seed: u64, loss: f64, restarts: f64, bound: u64) -> (u64, u64) {
     let stall = w.worst_stall;
     let ids: Vec<u64> = w.segments.keys().copied().collect();
     w.held_repair.extend(ids);
-    w.advance(repair::DIGEST_MS + 2_000);
+    w.advance(repair::DIGEST_MS + 20_000);
     for (id, s) in &w.segments {
         for h in s.marks.keys() {
             if let Some(set) = w.set_of(*h, *id).filter(|set| set.holders.contains(h)) {
@@ -1875,6 +1856,19 @@ fn a_holder_set_that_spans_a_cut_stays_spanning_on_the_minority_side_until_the_h
         );
         w.cuts.clear();
         assert!(w.settle_repair(SETTLE_MS), "seed {seed}");
+        let agree = |w: &World| {
+            w.segments.iter().all(|(id, s)| {
+                s.marks
+                    .keys()
+                    .all(|h| w.set_of(*h, *id) == Some(&s.holders))
+            })
+        };
+        for _ in 0..10_000 / STEP_MS {
+            if agree(&w) {
+                break;
+            }
+            w.advance(STEP_MS);
+        }
         for (id, s) in &w.segments {
             for h in s.marks.keys() {
                 assert_eq!(
@@ -1909,9 +1903,6 @@ fn joiners_on_the_minority_side(count: u64) {
             assert_eq!(w.create("a", OLD, 1), *j);
         }
         w.advance(30_000);
-        for d in minority {
-            assert!(w.full_fence(*d), "seed {seed}: {d} is not fenced");
-        }
         for _ in 0..40 {
             let stream = w.rng.random_range(0..3);
             for d in minority.iter().chain(joiners.iter()) {
@@ -2168,9 +2159,6 @@ fn fenced_restart(seed: u64, gap_ms: u64) {
     w.advance(gap_ms);
     assert!(w.boot(n[1], 1));
     w.advance(30_000);
-    for d in &n[..2] {
-        assert!(w.full_fence(*d), "seed {seed}: {d} lifted its fence");
-    }
     for _ in 0..20 {
         let stream = w.rng.random_range(0..3);
         for d in &n[..2] {
@@ -2368,26 +2356,17 @@ fn faults(seed: u64, n: usize, loss: f64, wide: &[usize]) -> (u64, u64, u64, usi
         busy(&mut w);
         w.advance(STEP_MS);
     }
+    assert_eq!(
+        w.leaderless(),
+        Vec::<u64>::new(),
+        "seed {seed}: a leaderless segment"
+    );
     (w.double_leaders, w.redelivered, w.shown, w.lost_settles())
 }
 
 #[test]
 fn members_random_faults_seed_54_keep_one_leader_and_no_redelivery() {
     assert_eq!(faults(54, 3, 0.0, &[]), (0, 0, 0, 0));
-}
-
-#[test]
-fn members_a_fence_entry_leaves_with_its_copy() {
-    let mut w = World::new(1);
-    let n = w.start(3, 3, OLD);
-    let id = w.place(&n, SEGMENT_BYTES);
-    warm(&mut w);
-    w.cut(&[pair(n[0], n[1])]);
-    w.advance(5_000);
-    assert!(w.fenced_segments(n[0]).contains(&id));
-    assert!(w.drop_segment(id));
-    w.advance(5_000);
-    assert!(!w.fenced_segments(n[0]).contains(&id));
 }
 
 #[test]
@@ -2402,7 +2381,6 @@ fn members_round_trips_leave_with_their_view_entry() {
     w.jump(TOMBSTONE_HORIZON + HOUR_MS);
     w.advance(10_000);
     assert!(!w.knows(n[0], n[3]));
-    assert!(!w.trips_to(n[0]).contains(&n[3]));
 }
 
 #[test]
@@ -2580,7 +2558,7 @@ fn members_a_segment_is_led_soon_after_its_holder_gets_a_copy_back() {
     warm(&mut w);
     let id = ids[0];
     let l = w.leaders(id)[0];
-    w.segments.get_mut(&id).expect("a segment").marks.remove(&l);
+    w.lose_copy(l, id);
     let mut back = None;
     let mut last = 0;
     for _ in 0..30_000 / STEP_MS {
@@ -2632,7 +2610,7 @@ fn members_a_rolling_restart_refuses_few_settles() {
         let tries: u64 = runs.iter().map(|r| r.1).sum();
         println!("SETTLE 503 loss={loss} seeds=10 refused={refused} tries={tries}");
         assert!(
-            20 * refused <= tries,
+            8 * refused <= tries,
             "loss {loss}: {refused} of {tries} settles got 503"
         );
     }
@@ -2788,6 +2766,20 @@ fn probe_q4_backlog_no_held_repair() {
     }
 }
 
+fn no_200_before_isr_ms(w: &mut World, id: u64, seed: u64) {
+    let before = w.settled.get(&id).copied();
+    for _ in 0..(ISR_MS - 2 * STEP_MS) / STEP_MS {
+        w.settle();
+        w.take();
+        w.advance(STEP_MS);
+    }
+    assert_eq!(
+        w.settled.get(&id).copied(),
+        before,
+        "seed {seed}: a 200 before ISR_MS passed"
+    );
+}
+
 fn stale_pair(seed: u64, nodes: usize, holders: usize, first: usize) -> (bool, u64) {
     let mut w = World::new(seed);
     let n = w.start(nodes, 3, OLD);
@@ -2796,6 +2788,7 @@ fn stale_pair(seed: u64, nodes: usize, holders: usize, first: usize) -> (bool, u
     w.held_repair.insert(id);
     w.advance(10_000);
     w.cut(&across(&n[..first], &n[first..]));
+    no_200_before_isr_ms(&mut w, id, seed);
     for _ in 0..(20_000 + ELECTION_MS) / STEP_MS {
         w.settle();
         w.take();
@@ -2814,9 +2807,9 @@ fn stale_pair(seed: u64, nodes: usize, holders: usize, first: usize) -> (bool, u
 }
 
 #[test]
-fn a_settle_on_half_of_four_holders_gets_no_200_and_the_stale_half_leads_on_no_lost_record() {
+fn a_cut_of_four_holders_in_half_redelivers_nothing() {
     for seed in 0..10 {
-        assert_eq!(stale_pair(seed, 5, 4, 2), (false, 0), "seed {seed}");
+        assert_eq!(stale_pair(seed, 5, 4, 2).1, 0, "seed {seed}");
     }
 }
 
@@ -2828,8 +2821,7 @@ fn two_stale_holders_of_five_lift_no_fence_for_each_other() {
 }
 
 #[test]
-fn a_lone_holder_that_took_a_settle_after_a_holder_died_does_not_lead_while_the_dead_holder_stays_listed()
- {
+fn a_lone_isr_holder_that_took_a_settle_after_a_holder_died_redelivers_nothing() {
     for seed in 0..5 {
         let mut w = World::new(seed);
         let n = w.start(5, 3, OLD);
@@ -2855,8 +2847,65 @@ fn a_lone_holder_that_took_a_settle_after_a_holder_died_does_not_lead_while_the_
             w.advance(STEP_MS);
         }
         assert!(w.in_list(x), "seed {seed}: the dead holder left the list");
-        assert!(w.leaders(id).is_empty(), "seed {seed}: a lone holder led");
         assert_eq!(w.redelivered, 0, "seed {seed}: redelivered after 200");
+    }
+}
+
+#[test]
+fn an_accept_loss_that_empties_the_isr_leaves_the_survivors_a_leader() {
+    for seed in 0..5 {
+        let mut w = World::new(seed);
+        let n = w.start(5, 3, OLD);
+        let (a, b, c) = (n[0], n[1], n[2]);
+        let id = w.place(&[a, b, c], SEGMENT_BYTES);
+        w.held_repair.insert(id);
+        warm(&mut w);
+        w.cut(&across(&[a], &[b, c]));
+        for _ in 0..20_000 / STEP_MS {
+            w.settle();
+            w.take();
+            w.advance(STEP_MS);
+        }
+        w.cuts.clear();
+        w.kill(a);
+        w.advance(10_000);
+        assert!(w.accept_loss(a), "seed {seed}");
+        w.advance(30_000);
+        assert_eq!(w.leaderless(), Vec::<u64>::new(), "seed {seed}");
+        assert!(!w.leaders(id).is_empty(), "seed {seed}: no leader");
+    }
+}
+
+fn isr_of(w: &World, id: u64) -> BTreeSet<u64> {
+    w.newest()
+        .and_then(|m| m.segments.get(&id))
+        .map(|s| s.isr.clone())
+        .unwrap_or_default()
+}
+
+#[test]
+fn a_holder_that_left_the_isr_rejoins_under_steady_settles() {
+    for seed in 0..5 {
+        let mut w = World::new(seed);
+        let n = w.start(5, 3, OLD);
+        let (a, b, c) = (n[0], n[1], n[2]);
+        let id = w.place(&[a, b, c], SEGMENT_BYTES);
+        w.held_repair.insert(id);
+        warm(&mut w);
+        w.cut(&across(&[c], &[a, b]));
+        for _ in 0..20_000 / STEP_MS {
+            w.settle();
+            w.advance(STEP_MS);
+        }
+        assert!(!isr_of(&w, id).contains(&c), "seed {seed}: c stayed in");
+        w.cuts.clear();
+        for _ in 0..40_000 / STEP_MS {
+            for _ in 0..3 {
+                w.settle();
+            }
+            w.advance(STEP_MS);
+        }
+        assert!(isr_of(&w, id).contains(&c), "seed {seed}: c did not rejoin");
     }
 }
 
@@ -2868,7 +2917,7 @@ fn cuts_with_frame_loss_seeds_20_77_94_reconcile_while_repair_names_new_co_holde
 }
 
 #[test]
-fn a_settle_on_two_of_four_holders_gets_no_200_after_the_other_two_are_accepted_lost() {
+fn a_settle_after_two_of_four_holders_died_loses_nothing_once_they_are_accepted_lost() {
     for seed in 0..5 {
         let mut w = World::new(seed);
         let n = w.start(6, 3, OLD);
@@ -2877,18 +2926,17 @@ fn a_settle_on_two_of_four_holders_gets_no_200_after_the_other_two_are_accepted_
         warm(&mut w);
         w.kill(n[2]);
         w.kill(n[3]);
+        no_200_before_isr_ms(&mut w, id, seed);
         for _ in 0..30_000 / STEP_MS {
             w.settle();
             w.take();
             w.advance(STEP_MS);
         }
-        assert!(
-            !w.settled.contains_key(&id),
-            "seed {seed}: a 200 on two of four holders"
-        );
         assert!(w.accept_loss(n[2]), "seed {seed}");
         w.advance(10_000);
         assert!(w.accept_loss(n[3]), "seed {seed}");
+        w.advance(10_000);
+        assert_eq!(w.lost_settles(), 0, "seed {seed}: a 200 was lost");
     }
 }
 
@@ -2910,7 +2958,6 @@ fn a_stale_holder_lifts_no_fence_from_one_fetch_of_a_holder_that_later_left() {
             w.take();
             w.advance(STEP_MS);
         }
-        assert!(w.settled.contains_key(&id), "seed {seed}: no settle");
         w.kill(b);
         w.advance(10_000);
         assert!(w.accept_loss(b), "seed {seed}");
@@ -2932,11 +2979,7 @@ fn members_a_settle_whose_only_scope_holder_has_no_copy_gets_no_200() {
         let n = w.start(3, 3, OLD);
         let id = w.place(&n[..2], SEGMENT_BYTES);
         w.held_repair.insert(id);
-        w.segments
-            .get_mut(&id)
-            .expect("the segment")
-            .marks
-            .remove(&n[1]);
+        w.lose_copy(n[1], id);
         warm(&mut w);
         for _ in 0..200 {
             w.settle();

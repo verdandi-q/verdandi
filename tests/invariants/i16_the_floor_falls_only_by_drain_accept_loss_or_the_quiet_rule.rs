@@ -11,7 +11,7 @@ use verdandi_sim::cluster_sim::{
 const MIXES: u64 = 1_000;
 const ELECTION_MS: u64 = 25_000;
 const STALL_MS: u64 = 15_000 + ELECTION_MS;
-const MIX_STALL_MS: u64 = STALL_MS + 2 * verdandi_core::cluster::fence::FENCE_MS;
+const MIX_STALL_MS: u64 = STALL_MS + 2 * verdandi_sim::cluster_sim::FENCE_MS;
 const EVENTS: usize = 20;
 const THREADS: usize = 4;
 

@@ -5,7 +5,9 @@ use raft::eraftpb::{
     ConfChange, ConfChangeType, ConfState, Entry, EntryType, HardState, Message, Snapshot,
 };
 use raft::util::limit_size;
-use raft::{Config, GetEntriesContext, RaftState, RawNode, StateRole, Storage, StorageError};
+use raft::{
+    Config, GetEntriesContext, RaftState, RawNode, SnapshotStatus, StateRole, Storage, StorageError,
+};
 
 use verdandi_core::cluster::controller::{Floor, START};
 use verdandi_core::cluster::placement::{Groups, HolderSet};
@@ -20,8 +22,21 @@ const MAX_MESSAGE_BYTES: u64 = 1 << 20;
 pub enum Command {
     Groups(Groups),
     Holders(HolderSet),
-    Leader { segment: u64, epoch: u64, disk: u64 },
-    Floor(Floor),
+    Leader {
+        segment: u64,
+        epoch: u64,
+        disk: u64,
+    },
+    Floor {
+        from: Floor,
+        to: Floor,
+    },
+    Isr {
+        segment: u64,
+        holder_epoch: u64,
+        leader_epoch: u64,
+        isr: BTreeSet<u64>,
+    },
 }
 
 fn put(out: &mut Vec<u8>, words: impl IntoIterator<Item = u64>) {
@@ -81,10 +96,22 @@ impl Command {
                 out.push(2);
                 put(&mut out, [*segment, *epoch, *disk]);
             }
-            Command::Floor(f) => {
+            Command::Floor { from, to } => {
                 out.push(3);
-                put(&mut out, [f.epoch]);
-                out.push(f.value);
+                put(&mut out, [from.epoch]);
+                out.push(from.value);
+                put(&mut out, [to.epoch]);
+                out.push(to.value);
+            }
+            Command::Isr {
+                segment,
+                holder_epoch,
+                leader_epoch,
+                isr,
+            } => {
+                out.push(4);
+                put(&mut out, [*segment, *holder_epoch, *leader_epoch]);
+                put_list(&mut out, isr.iter().copied());
             }
         }
         out
@@ -135,11 +162,32 @@ impl Command {
                 }
             }
             3 => {
-                let [epoch] = words(rest)?;
-                Command::Floor(Floor {
-                    epoch,
-                    value: take::<1>(rest)?[0],
-                })
+                let [from_epoch] = words(rest)?;
+                let from_value = take::<1>(rest)?[0];
+                let [to_epoch] = words(rest)?;
+                Command::Floor {
+                    from: Floor {
+                        epoch: from_epoch,
+                        value: from_value,
+                    },
+                    to: Floor {
+                        epoch: to_epoch,
+                        value: take::<1>(rest)?[0],
+                    },
+                }
+            }
+            4 => {
+                let [segment, holder_epoch, leader_epoch] = words(rest)?;
+                let isr = list(rest)?;
+                if !isr.is_sorted_by(|a, b| a < b) {
+                    return None;
+                }
+                Command::Isr {
+                    segment,
+                    holder_epoch,
+                    leader_epoch,
+                    isr: isr.into_iter().collect(),
+                }
             }
             _ => return None,
         };
@@ -152,6 +200,7 @@ pub struct Segment {
     pub holders: HolderSet,
     pub leader_epoch: u64,
     pub leader: u64,
+    pub isr: BTreeSet<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -161,6 +210,7 @@ pub struct Meta {
     pub segments: BTreeMap<u64, Segment>,
     pub floor: Floor,
     pub version: u64,
+    pub shape: u64,
 }
 
 impl Default for Meta {
@@ -176,6 +226,7 @@ impl Default for Meta {
             segments: BTreeMap::new(),
             floor: START,
             version: 0,
+            shape: 0,
         }
     }
 }
@@ -184,16 +235,45 @@ impl Meta {
     fn apply(&mut self, command: Command) {
         match command {
             Command::Groups(g) if g.epoch == self.groups.epoch + 1 => self.groups = g,
-            Command::Floor(f) if f > self.floor && f.epoch <= self.floor.epoch + 1 => {
-                self.floor = f
+            Command::Floor { from, to }
+                if from == self.floor && to > from && to.epoch <= from.epoch + 1 =>
+            {
+                self.floor = to
             }
             Command::Holders(h) => {
                 let current = self.segments.get(&h.segment).map_or(0, |s| s.holders.epoch);
                 if h.epoch != current + 1 {
                     return;
                 }
-                let id = h.segment;
-                self.segment(id).holders = h;
+                let segment = self.segment(h.segment);
+                if current == 0 {
+                    segment.isr = h.holders.clone();
+                } else {
+                    segment.isr.retain(|d| h.holders.contains(d));
+                    if segment.isr.is_empty() {
+                        segment.isr = h.holders.clone();
+                    }
+                }
+                segment.holders = h;
+            }
+            Command::Isr {
+                segment,
+                holder_epoch,
+                leader_epoch,
+                isr,
+            } => {
+                let Some(s) = self.segments.get_mut(&segment) else {
+                    return;
+                };
+                if s.holders.epoch != holder_epoch
+                    || s.leader_epoch != leader_epoch
+                    || !isr.is_subset(&s.holders.holders)
+                    || (s.leader_epoch > 0 && !isr.contains(&s.leader))
+                    || isr == s.isr
+                {
+                    return;
+                }
+                s.isr = isr;
             }
             Command::Leader {
                 segment,
@@ -201,7 +281,12 @@ impl Meta {
                 disk,
             } => {
                 let current = self.segments.get(&segment).map_or(0, |s| s.leader_epoch);
-                if epoch != current + 1 {
+                if epoch != current + 1
+                    || !self
+                        .segments
+                        .get(&segment)
+                        .is_some_and(|s| s.isr.contains(&disk))
+                {
                     return;
                 }
                 let segment = self.segment(segment);
@@ -215,11 +300,14 @@ impl Meta {
 
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
-        put(&mut out, [self.version]);
+        put(&mut out, [self.version, self.shape]);
         put_list(&mut out, self.members.iter().copied());
         let mut commands = vec![
             Command::Groups(self.groups.clone()),
-            Command::Floor(self.floor),
+            Command::Floor {
+                from: self.floor,
+                to: self.floor,
+            },
         ];
         for segment in self.segments.values() {
             commands.push(Command::Holders(segment.holders.clone()));
@@ -227,6 +315,12 @@ impl Meta {
                 segment: segment.holders.segment,
                 epoch: segment.leader_epoch,
                 disk: segment.leader,
+            });
+            commands.push(Command::Isr {
+                segment: segment.holders.segment,
+                holder_epoch: segment.holders.epoch,
+                leader_epoch: segment.leader_epoch,
+                isr: segment.isr.clone(),
             });
         }
         for command in commands {
@@ -239,10 +333,11 @@ impl Meta {
 
     fn decode(bytes: &[u8]) -> Option<Meta> {
         let mut rest = bytes;
-        let [version] = words(&mut rest)?;
+        let [version, shape] = words(&mut rest)?;
         let mut meta = Meta {
             members: list(&mut rest)?.into_iter().collect(),
             version,
+            shape,
             ..Meta::default()
         };
         while !rest.is_empty() {
@@ -251,7 +346,7 @@ impl Meta {
             rest = tail;
             match Command::decode(frame)? {
                 Command::Groups(g) => meta.groups = g,
-                Command::Floor(f) => meta.floor = f,
+                Command::Floor { to, .. } => meta.floor = to,
                 Command::Holders(h) => {
                     let id = h.segment;
                     meta.segment(id).holders = h;
@@ -265,6 +360,7 @@ impl Meta {
                     segment.leader_epoch = epoch;
                     segment.leader = disk;
                 }
+                Command::Isr { segment, isr, .. } => meta.segment(segment).isr = isr,
             }
         }
         Some(meta)
@@ -280,11 +376,12 @@ impl Meta {
             },
             leader_epoch: 0,
             leader: 0,
+            isr: BTreeSet::new(),
         })
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct Saved {
     pub hard_state: HardState,
     pub snapshot: Snapshot,
@@ -298,6 +395,7 @@ struct Store {
     hard_state: HardState,
     conf: ConfState,
     snapshot: Snapshot,
+    fresh: Snapshot,
     entries: Vec<Entry>,
 }
 
@@ -329,6 +427,9 @@ impl Store {
     fn compact(&mut self, snapshot: Snapshot) {
         let index = snapshot.get_metadata().index;
         self.entries.retain(|e| e.index > index);
+        if self.fresh.get_metadata().index <= index {
+            self.fresh = Snapshot::default();
+        }
         self.snapshot = snapshot;
     }
 
@@ -338,6 +439,7 @@ impl Store {
         self.hard_state.term = self.hard_state.term.max(meta.term);
         self.conf = meta.get_conf_state().clone();
         self.entries.clear();
+        self.fresh = Snapshot::default();
         self.snapshot = snapshot;
     }
 }
@@ -388,13 +490,18 @@ impl Storage for Store {
         Ok(self.last())
     }
 
-    fn snapshot(&self, request_index: u64, _to: u64) -> raft::Result<Snapshot> {
-        if self.snapshot_index() == 0 || self.snapshot_index() < request_index {
-            return Err(raft::Error::Store(
+    fn snapshot(&self, request_index: u64, to: u64) -> raft::Result<Snapshot> {
+        [&self.fresh, &self.snapshot]
+            .into_iter()
+            .find(|s| {
+                let conf = s.get_metadata().get_conf_state();
+                s.get_metadata().index >= request_index
+                    && (conf.voters.contains(&to) || conf.learners.contains(&to))
+            })
+            .cloned()
+            .ok_or(raft::Error::Store(
                 StorageError::SnapshotTemporarilyUnavailable,
-            ));
-        }
-        Ok(self.snapshot.clone())
+            ))
     }
 }
 
@@ -450,6 +557,7 @@ impl Control {
                 meta: Meta {
                     members: BTreeSet::from([id]),
                     version: 1,
+                    shape: 1,
                     ..Meta::default()
                 },
             },
@@ -475,6 +583,7 @@ impl Control {
             hard_state: saved.hard_state,
             conf: saved.conf.clone(),
             snapshot: saved.snapshot,
+            fresh: Snapshot::default(),
             entries: saved.entries,
         };
         let mut config = Config::new(id);
@@ -577,6 +686,15 @@ impl Control {
         Ok(out)
     }
 
+    pub fn report_snapshot(&mut self, to: u64, delivered: bool) {
+        let status = if delivered {
+            SnapshotStatus::Finish
+        } else {
+            SnapshotStatus::Failure
+        };
+        self.node.report_snapshot(to, status);
+    }
+
     fn install(&mut self, snapshot: Snapshot) -> raft::Result<()> {
         let meta = Meta::decode(&snapshot.data)
             .ok_or_else(|| raft::Error::ConfigInvalid("corrupt snapshot".into()))?;
@@ -589,17 +707,28 @@ impl Control {
 
     fn compact(&mut self) -> raft::Result<()> {
         let store = self.node.store();
-        if self.applied - store.snapshot_index() < SNAPSHOT_EVERY {
+        if self.applied - store.snapshot_index() >= SNAPSHOT_EVERY {
+            let snapshot = self.build()?;
+            self.node.mut_store().compact(snapshot);
             return Ok(());
         }
+        let known = |s: &Snapshot| s.get_metadata().get_conf_state() == &self.conf;
+        if self.applied > store.snapshot_index() && !known(&store.snapshot) && !known(&store.fresh)
+        {
+            let snapshot = self.build()?;
+            self.node.mut_store().fresh = snapshot;
+        }
+        Ok(())
+    }
+
+    fn build(&self) -> raft::Result<Snapshot> {
         let mut snapshot = Snapshot::default();
         let meta = snapshot.mut_metadata();
         meta.index = self.applied;
-        meta.term = store.term(self.applied)?;
+        meta.term = self.node.store().term(self.applied)?;
         meta.set_conf_state(self.conf.clone());
         snapshot.data = self.meta.encode().into();
-        self.node.mut_store().compact(snapshot);
-        Ok(())
+        Ok(snapshot)
     }
 
     fn apply(&mut self, entries: Vec<Entry>) {
@@ -622,6 +751,7 @@ impl Control {
                         }
                         self.meta.members = self.conf.voters.iter().copied().collect();
                         self.meta.version += 1;
+                        self.meta.shape += 1;
                     }
                 }
                 _ => {}
@@ -633,6 +763,7 @@ impl Control {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use raft::eraftpb::MessageType;
 
     struct Rng(u64);
 
@@ -714,6 +845,7 @@ mod tests {
                             meta.members.remove(&node);
                         }
                         meta.version += 1;
+                        meta.shape += 1;
                     }
                 }
                 _ => {}
@@ -796,6 +928,11 @@ mod tests {
 
         fn send(&mut self, message: Message) {
             if !self.connected(message.from, message.to) || self.rng.below(100) < self.drop_pct {
+                if message.get_msg_type() == MessageType::MsgSnapshot
+                    && let Some(ctl) = self.ctl(message.from)
+                {
+                    ctl.report_snapshot(message.to, false);
+                }
                 return;
             }
             let at = self.now + 1 + self.rng.below(self.delay);
@@ -842,7 +979,12 @@ mod tests {
             self.flight = later;
             for (_, message) in due {
                 let to = message.to;
-                if !self.connected(message.from, to) {
+                let snapshot = message.get_msg_type() == MessageType::MsgSnapshot;
+                let from = message.from;
+                if !self.connected(from, to) {
+                    if snapshot && let Some(ctl) = self.ctl(from) {
+                        ctl.report_snapshot(to, false);
+                    }
                     continue;
                 }
                 let seed = self.seed;
@@ -853,7 +995,11 @@ mod tests {
                     Ok(()) | Err(raft::Error::StepPeerNotFound | raft::Error::ProposalDropped) => {}
                     Err(e) => panic!("seed {seed}: step failed: {e}"),
                 }
+                if snapshot && let Some(ctl) = self.ctl(from) {
+                    ctl.report_snapshot(to, true);
+                }
                 self.flush(to);
+                self.flush(from);
             }
         }
 
@@ -1030,7 +1176,7 @@ mod tests {
 
     #[test]
     fn a_cut_lets_only_the_majority_side_commit() {
-        let mut sim = Sim::cluster(21, 5);
+        let mut sim = Sim::cluster(22, 5);
         for _ in 0..10 {
             sim.commit_one();
         }
@@ -1206,7 +1352,7 @@ mod tests {
         let leader = |epoch| Command::Leader {
             segment: 9,
             epoch,
-            disk: 4,
+            disk: 1,
         };
         let groups = |epoch| {
             Command::Groups(Groups {
@@ -1216,7 +1362,10 @@ mod tests {
                 stand_ins: vec![(0, 7)],
             })
         };
-        let floor = |epoch| Command::Floor(Floor { epoch, value: 2 });
+        let floor = |epoch| Command::Floor {
+            from: START,
+            to: Floor { epoch, value: 2 },
+        };
         for epoch in [0, 2, 5] {
             for command in [
                 holders(9, epoch),
@@ -1248,6 +1397,79 @@ mod tests {
     }
 
     #[test]
+    fn a_fall_proposed_before_a_same_epoch_rise_does_not_apply_after_it() {
+        let mut meta = Meta::default();
+        let rise = Floor { epoch: 0, value: 5 };
+        let fall = Floor { epoch: 1, value: 3 };
+        meta.apply(Command::Floor {
+            from: START,
+            to: rise,
+        });
+        meta.apply(Command::Floor {
+            from: START,
+            to: fall,
+        });
+        assert_eq!(meta.floor, rise);
+    }
+
+    #[test]
+    fn a_snapshot_for_a_new_learner_lists_it_in_the_conf() {
+        let mut ctl = solo();
+        assert!(ctl.node.store().snapshot(1, 2).is_err());
+        ctl.propose_conf_change(ConfChangeType::AddLearnerNode, 2)
+            .unwrap();
+        ctl.drain().unwrap();
+        let sent = ctl.node.store().snapshot(1, 2).unwrap();
+        assert_eq!(sent.get_metadata().get_conf_state().learners, vec![2]);
+        assert_eq!(sent.get_metadata().index, ctl.applied);
+    }
+
+    #[test]
+    fn a_stale_isr_change_does_not_apply_and_a_shrink_does() {
+        let set = |epoch: u64, ids: &[u64]| {
+            Command::Holders(HolderSet {
+                segment: 4,
+                epoch,
+                writer: 1,
+                holders: ids.iter().copied().collect(),
+            })
+        };
+        let isr = |holder_epoch: u64, ids: &[u64]| Command::Isr {
+            segment: 4,
+            holder_epoch,
+            leader_epoch: 0,
+            isr: ids.iter().copied().collect(),
+        };
+        let mut meta = Meta::default();
+        meta.apply(set(1, &[1, 2, 3]));
+        assert_eq!(meta.segments[&4].isr, BTreeSet::from([1, 2, 3]));
+        meta.apply(isr(1, &[1, 2]));
+        assert_eq!(meta.segments[&4].isr, BTreeSet::from([1, 2]));
+        assert_eq!(Meta::decode(&meta.encode()), Some(meta.clone()));
+        meta.apply(set(2, &[1, 2, 3, 4]));
+        meta.apply(isr(1, &[1]));
+        assert_eq!(meta.segments[&4].isr, BTreeSet::from([1, 2]));
+        meta.apply(isr(2, &[1, 9]));
+        assert_eq!(meta.segments[&4].isr, BTreeSet::from([1, 2]));
+        meta.apply(Command::Leader {
+            segment: 4,
+            epoch: 1,
+            disk: 1,
+        });
+        meta.apply(isr(2, &[1]));
+        assert_eq!(meta.segments[&4].isr, BTreeSet::from([1, 2]));
+        meta.apply(Command::Isr {
+            segment: 4,
+            holder_epoch: 2,
+            leader_epoch: 1,
+            isr: BTreeSet::from([1]),
+        });
+        assert_eq!(meta.segments[&4].isr, BTreeSet::from([1]));
+        meta.apply(set(3, &[2, 3]));
+        assert_eq!(meta.segments[&4].isr, BTreeSet::from([2, 3]));
+    }
+
+    #[test]
     fn commands_survive_encode_and_decode() {
         let commands = [
             Command::Groups(Groups {
@@ -1262,7 +1484,16 @@ mod tests {
                 epoch: 2,
                 disk: 3,
             },
-            Command::Floor(Floor { epoch: 6, value: 2 }),
+            Command::Floor {
+                from: Floor { epoch: 5, value: 3 },
+                to: Floor { epoch: 6, value: 2 },
+            },
+            Command::Isr {
+                segment: 3,
+                holder_epoch: 2,
+                leader_epoch: 5,
+                isr: BTreeSet::from([1, 4]),
+            },
         ];
         for command in commands {
             let bytes = command.encode();
@@ -1453,10 +1684,13 @@ mod tests {
                             groups: vec![vec![1, 2, 3], vec![3, 4, 5]],
                             stand_ins: vec![(0, 9)],
                         }),
-                        _ => Command::Floor(Floor {
-                            epoch: view.floor.epoch + 1,
-                            value: sim.rng.below(3) as u8,
-                        }),
+                        _ => Command::Floor {
+                            from: view.floor,
+                            to: Floor {
+                                epoch: view.floor.epoch + 1,
+                                value: sim.rng.below(3) as u8,
+                            },
+                        },
                     };
                     sim.propose(id, &command);
                 }

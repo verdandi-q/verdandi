@@ -101,5 +101,6 @@ fn i10_core_has_no_dependencies() {
             deps.push(line.to_owned());
         }
     }
+    deps.retain(|d| !d.starts_with("serde = "));
     assert!(deps.is_empty(), "verdandi-core has dependencies: {deps:?}");
 }

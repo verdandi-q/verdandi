@@ -1,6 +1,5 @@
 pub mod controller;
 pub mod domains;
-pub mod fence;
 pub mod placement;
 pub mod repair;
 pub mod steer;

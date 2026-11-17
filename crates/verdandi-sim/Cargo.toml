@@ -8,6 +8,7 @@ publish.workspace = true
 [dependencies]
 verdandi-control = { path = "../verdandi-control" }
 verdandi-core = { path = "../verdandi-core" }
+verdandi-node = { path = "../verdandi-node" }
 verdandi-store = { path = "../verdandi-store" }
 rand = { version = "0.9.5", default-features = false }
 raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }

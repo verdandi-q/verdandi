@@ -13,7 +13,9 @@ pub struct Groups {
     pub stand_ins: Vec<(usize, u64)>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(
+    Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, serde::Serialize, serde::Deserialize,
+)]
 pub struct HolderSet {
     pub segment: u64,
     pub epoch: u64,

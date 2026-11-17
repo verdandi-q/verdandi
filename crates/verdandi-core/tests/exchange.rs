@@ -31,6 +31,7 @@ fn full_body(disk: u64, members: &[u64], holds: u64) -> Body {
         domains: 42,
         quiet: true,
         reconciled: true,
+        marks: Default::default(),
         unreachable: vec![1, 2],
         signals: 0,
         remaining: 0,
