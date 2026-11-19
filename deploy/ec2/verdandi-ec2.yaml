@@ -19,26 +19,45 @@ Parameters:
     Type: AWS::EC2::Subnet::Id
   ClientCidr:
     Type: String
-    Description: Address range of the clients. They reach the load balancer on port 80.
+    Description: Address range of the clients. They reach the load balancer on port 443 when CertificateArn is set, else on port 80.
   ClusterKeyParameter:
     Type: String
     Description: Name of the SSM SecureString parameter, without a leading slash, that holds the cluster key. Run verdandi keygen to make one.
   BackupUrl:
     Type: String
     Default: ""
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate for the HTTPS listener on port 443. Leave it empty for plain HTTP on port 80.
+  EcrRepositoryArn:
+    Type: String
+    Default: ""
+    Description: ARN of the ECR repository of ImageUri. Set it when the image is in a private ECR repository.
   DesiredCapacity:
     Type: Number
     Default: 3
     MinValue: 1
-  MinInServiceDuringUpdate:
-    Type: Number
-    Default: 2
-    Description: Set it to one less than DesiredCapacity. The update stops one instance, then starts its replacement.
+    MaxValue: 10
   ReadyGraceSeconds:
     Type: Number
     Default: 900
+Mappings:
+  Sizing:
+    "1": {MinInService: 0}
+    "2": {MinInService: 1}
+    "3": {MinInService: 2}
+    "4": {MinInService: 3}
+    "5": {MinInService: 4}
+    "6": {MinInService: 5}
+    "7": {MinInService: 6}
+    "8": {MinInService: 7}
+    "9": {MinInService: 8}
+    "10": {MinInService: 9}
 Conditions:
   HasBackup: !Not [!Equals [!Ref BackupUrl, ""]]
+  HasCert: !Not [!Equals [!Ref CertificateArn, ""]]
+  HasEcr: !Not [!Equals [!Ref EcrRepositoryArn, ""]]
 Resources:
   InstanceRole:
     Type: AWS::IAM::Role
@@ -61,6 +80,45 @@ Resources:
               - Effect: Allow
                 Action: cloudformation:SignalResource
                 Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+              - Effect: Allow
+                Action: autoscaling:CompleteLifecycleAction
+                Resource: !Sub "arn:${AWS::Partition}:autoscaling:${AWS::Region}:${AWS::AccountId}:autoScalingGroup:*:autoScalingGroupName/${AWS::StackName}-group"
+              - !If
+                - HasEcr
+                - Effect: Allow
+                  Action: ecr:GetAuthorizationToken
+                  Resource: "*"
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasEcr
+                - Effect: Allow
+                  Action:
+                    - ecr:BatchGetImage
+                    - ecr:GetDownloadUrlForLayer
+                  Resource: !Ref EcrRepositoryArn
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasBackup
+                - Effect: Allow
+                  Action:
+                    - s3:ListBucket
+                    - s3:ListBucketMultipartUploads
+                  Resource: !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}"
+                    - Bucket: !Select [2, !Split ["/", !Ref BackupUrl]]
+                - !Ref "AWS::NoValue"
+              - !If
+                - HasBackup
+                - Effect: Allow
+                  Action:
+                    - s3:GetObject
+                    - s3:PutObject
+                    - s3:DeleteObject
+                    - s3:AbortMultipartUpload
+                  Resource: !Sub
+                    - "arn:${AWS::Partition}:s3:::${Bucket}/*"
+                    - Bucket: !Select [2, !Split ["/", !Ref BackupUrl]]
+                - !Ref "AWS::NoValue"
   InstanceProfile:
     Type: AWS::IAM::InstanceProfile
     Properties:
@@ -73,9 +131,17 @@ Resources:
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
+          FromPort: !If [HasCert, 443, 80]
+          ToPort: !If [HasCert, 443, 80]
           CidrIp: !Ref ClientCidr
+  NodesToLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref LoadBalancerGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref InstanceGroup
   InstanceGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -139,6 +205,19 @@ Resources:
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
+  TlsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCert
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
   LaunchTemplate:
     Type: AWS::EC2::LaunchTemplate
     Properties:
@@ -160,6 +239,7 @@ Resources:
               set -euo pipefail
               dnf install -y docker aws-cfn-bootstrap
               systemctl enable --now docker
+              ${EcrLogin}
               mkdir -p /var/lib/verdandi
               chown 10001:10001 /var/lib/verdandi
               TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
@@ -173,9 +253,37 @@ Resources:
                 --env-file /etc/verdandi.env -e POD_IP="$IP" \
                 -e VERDANDI_CLUSTER_URL=http://${LoadBalancer.DNSName} ${BackupFlag} \
                 ${ImageUri}
+              cat > /usr/local/bin/verdandi-drain.sh <<'EOF'
+              #!/bin/bash
+              set -uo pipefail
+              while true; do
+                T=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60")
+                S=$(curl -s -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/autoscaling/target-lifecycle-state)
+                [ "$S" = "Terminated" ] && break
+                sleep 5
+              done
+              ID=$(curl -s -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/instance-id)
+              docker stop --time 120 verdandi
+              aws autoscaling complete-lifecycle-action --region ${AWS::Region} --auto-scaling-group-name ${AWS::StackName}-group --lifecycle-hook-name verdandi-stop --lifecycle-action-result CONTINUE --instance-id "$ID"
+              EOF
+              chmod +x /usr/local/bin/verdandi-drain.sh
+              cat > /etc/systemd/system/verdandi-drain.service <<'EOF'
+              [Unit]
+              After=docker.service
+              [Service]
+              ExecStart=/usr/local/bin/verdandi-drain.sh
+              Restart=on-failure
+              [Install]
+              WantedBy=multi-user.target
+              EOF
+              systemctl enable --now verdandi-drain.service
               until curl -fs "http://$IP:8080/readyz"; do sleep 5; done
               cfn-signal -e 0 --stack ${AWS::StackName} --resource Group --region ${AWS::Region}
             - BackupFlag: !If [HasBackup, !Sub "-e VERDANDI_BACKUP_URL=${BackupUrl}", ""]
+              EcrLogin: !If
+                - HasEcr
+                - !Sub "aws ecr get-login-password --region ${AWS::Region} | docker login --username AWS --password-stdin $(echo ${ImageUri} | cut -d/ -f1)"
+                - "true"
   Group:
     Type: AWS::AutoScaling::AutoScalingGroup
     DependsOn: Listener
@@ -186,7 +294,7 @@ Resources:
     UpdatePolicy:
       AutoScalingRollingUpdate:
         MaxBatchSize: 1
-        MinInstancesInService: !Ref MinInServiceDuringUpdate
+        MinInstancesInService: !FindInMap [Sizing, !Ref DesiredCapacity, MinInService]
         PauseTime: PT30M
         WaitOnResourceSignals: true
         SuspendProcesses:
@@ -196,6 +304,7 @@ Resources:
           - AlarmNotification
           - ScheduledActions
     Properties:
+      AutoScalingGroupName: !Sub "${AWS::StackName}-group"
       MinSize: !Ref DesiredCapacity
       MaxSize: !Ref DesiredCapacity
       DesiredCapacity: !Ref DesiredCapacity
@@ -217,4 +326,6 @@ Resources:
           DefaultResult: CONTINUE
 Outputs:
   Url:
-    Value: !Sub "http://${LoadBalancer.DNSName}"
+    Value: !Sub
+      - "${Scheme}://${LoadBalancer.DNSName}"
+      - Scheme: !If [HasCert, https, http]

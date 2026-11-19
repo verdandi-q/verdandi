@@ -13,7 +13,11 @@ Parameters:
     Type: AWS::EC2::Subnet::Id
   ClientCidr:
     Type: String
-    Description: Address range of the clients. They reach the load balancer on port 80.
+    Description: Address range of the clients. They reach the load balancer on port 443 when CertificateArn is set, else on port 80.
+  CertificateArn:
+    Type: String
+    Default: ""
+    Description: ACM certificate for the HTTPS listener on port 443. Leave it empty for plain HTTP on port 80.
   ClusterKeySecretArn:
     Type: String
     Description: Secrets Manager secret that holds the cluster key. Run verdandi keygen to make one.
@@ -29,10 +33,7 @@ Parameters:
     Type: Number
     Default: 3
     MinValue: 1
-  MinimumHealthyPercent:
-    Type: Number
-    Default: 66
-    Description: Size it to one task less than DesiredCount. For 3 tasks use 66. For 5 use 80.
+    MaxValue: 10
   CpuUnits:
     Type: String
     Default: "1024"
@@ -42,7 +43,20 @@ Parameters:
   ReadyGraceSeconds:
     Type: Number
     Default: 900
+Mappings:
+  Sizing:
+    "1": {MinHealthy: 0}
+    "2": {MinHealthy: 50}
+    "3": {MinHealthy: 66}
+    "4": {MinHealthy: 75}
+    "5": {MinHealthy: 80}
+    "6": {MinHealthy: 83}
+    "7": {MinHealthy: 85}
+    "8": {MinHealthy: 87}
+    "9": {MinHealthy: 88}
+    "10": {MinHealthy: 90}
 Conditions:
+  HasCert: !Not [!Equals [!Ref CertificateArn, ""]]
   HasBackup: !Not [!Equals [!Ref BackupUrl, ""]]
   HasTaskRole: !Not [!Equals [!Ref TaskRoleArn, ""]]
 Resources:
@@ -79,9 +93,17 @@ Resources:
       VpcId: !Ref VpcId
       SecurityGroupIngress:
         - IpProtocol: tcp
-          FromPort: 80
-          ToPort: 80
+          FromPort: !If [HasCert, 443, 80]
+          ToPort: !If [HasCert, 443, 80]
           CidrIp: !Ref ClientCidr
+  TasksToLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref LoadBalancerGroup
+      IpProtocol: tcp
+      FromPort: 80
+      ToPort: 80
+      SourceSecurityGroupId: !Ref TaskGroup
   TaskGroup:
     Type: AWS::EC2::SecurityGroup
     Properties:
@@ -145,6 +167,19 @@ Resources:
       DefaultActions:
         - Type: forward
           TargetGroupArn: !Ref TargetGroup
+  TlsListener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Condition: HasCert
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTPS
+      Port: 443
+      SslPolicy: ELBSecurityPolicy-TLS13-1-2-2021-06
+      Certificates:
+        - CertificateArn: !Ref CertificateArn
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
   TaskDefinition:
     Type: AWS::ECS::TaskDefinition
     Properties:
@@ -200,7 +235,7 @@ Resources:
       HealthCheckGracePeriodSeconds: !Ref ReadyGraceSeconds
       DeploymentConfiguration:
         MaximumPercent: 100
-        MinimumHealthyPercent: !Ref MinimumHealthyPercent
+        MinimumHealthyPercent: !FindInMap [Sizing, !Ref DesiredCount, MinHealthy]
       NetworkConfiguration:
         AwsvpcConfiguration:
           AssignPublicIp: DISABLED
@@ -216,4 +251,6 @@ Resources:
           TargetGroupArn: !Ref TargetGroup
 Outputs:
   Url:
-    Value: !Sub "http://${LoadBalancer.DNSName}"
+    Value: !Sub
+      - "${Scheme}://${LoadBalancer.DNSName}"
+      - Scheme: !If [HasCert, https, http]

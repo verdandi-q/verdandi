@@ -3,6 +3,8 @@ image:
   tag: c5
   pullPolicy: IfNotPresent
 replicas: 3
+zoneSpread:
+  whenUnsatisfiable: ScheduleAnyway
 clusterKey:
   secretName: ""
   secretKey: key
