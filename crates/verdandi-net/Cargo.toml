@@ -12,10 +12,13 @@ verdandi-node = { path = "../verdandi-node" }
 postcard = { version = "1", default-features = false, features = ["alloc"] }
 object_store = { version = "0.14.2", features = ["aws"] }
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
+sha2 = { version = "0.10", default-features = false }
 snow = { version = "0.10.0", default-features = false, features = ["ring-accelerated", "use-curve25519", "use-chacha20poly1305", "use-sha2"] }
+tokio = { version = "1.53.2", features = ["io-util", "macros", "net", "rt", "sync", "time"] }
+serde = { version = "1", features = ["derive"] }
 zstd = { version = "0.14.0", default-features = false }
 
 [dev-dependencies]
-tokio = { version = "1.53.2", features = ["macros", "rt"] }
+tokio = { version = "1.53.2", features = ["macros", "rt", "time"] }
 url = "2"
 raft = { version = "0.7", default-features = false, features = ["protobuf-codec"] }

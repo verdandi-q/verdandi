@@ -4,6 +4,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 
+use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
 use verdandi_core::ids::SegmentId;
 
@@ -58,12 +59,16 @@ enum Command {
         commit_ms: u64,
         body: Vec<u8>,
         preallocate: u64,
+        announce: bool,
         reply: oneshot::Sender<Result<Written, Error>>,
     },
     Seal {
         reply: oneshot::Sender<Result<(), Error>>,
     },
+    Subscribe(UnboundedSender<Committed>),
 }
+
+pub type Committed = (SegmentId, u64, Vec<u8>);
 
 pub struct Log {
     epochs: Arc<AtomicU64>,
@@ -85,6 +90,7 @@ impl Log {
             epochs: Arc::clone(&epochs),
             active: None,
             stopped: false,
+            hook: None,
         };
         let handle = thread::spawn(move || {
             for command in rx {
@@ -93,11 +99,16 @@ impl Log {
                         commit_ms,
                         body,
                         preallocate,
+                        announce,
                         reply,
                     } => reply
-                        .send(writer.append(commit_ms, &body, preallocate))
+                        .send(writer.append(commit_ms, &body, preallocate, announce))
                         .ok(),
                     Command::Seal { reply } => reply.send(writer.seal_command()).ok(),
+                    Command::Subscribe(tx) => {
+                        writer.hook = Some(tx);
+                        None
+                    }
                 };
             }
             drop(writer);
@@ -128,14 +139,29 @@ impl Log {
         body: Vec<u8>,
         preallocate: u64,
     ) -> oneshot::Receiver<Result<Written, Error>> {
+        self.append_as(commit_ms, body, preallocate, true)
+    }
+
+    pub fn append_as(
+        &self,
+        commit_ms: u64,
+        body: Vec<u8>,
+        preallocate: u64,
+        announce: bool,
+    ) -> oneshot::Receiver<Result<Written, Error>> {
         let (reply, rx) = oneshot::channel();
         self.send(Command::Append {
             commit_ms,
             body,
             preallocate,
+            announce,
             reply,
         });
         rx
+    }
+
+    pub fn subscribe(&self, tx: UnboundedSender<Committed>) {
+        self.send(Command::Subscribe(tx));
     }
 
     pub fn seal(&self) -> oneshot::Receiver<Result<(), Error>> {
@@ -179,6 +205,7 @@ struct Writer<F: Fs> {
     epochs: Arc<AtomicU64>,
     active: Option<Active<F::File>>,
     stopped: bool,
+    hook: Option<UnboundedSender<Committed>>,
 }
 
 fn full(e: &io::Error) -> bool {
@@ -208,12 +235,18 @@ impl<F: Fs> Writer<F> {
         result
     }
 
-    fn append(&mut self, commit_ms: u64, body: &[u8], preallocate: u64) -> Result<Written, Error> {
+    fn append(
+        &mut self,
+        commit_ms: u64,
+        body: &[u8],
+        preallocate: u64,
+        announce: bool,
+    ) -> Result<Written, Error> {
         let total = BLOCK_HEADER_LEN + body.len();
         if total > MAX_BLOCK {
             return Err(Error::TooLarge(total));
         }
-        self.guarded(|w| w.write_block(commit_ms, body, total as u64, preallocate))
+        self.guarded(|w| w.write_block(commit_ms, body, total as u64, preallocate, announce))
     }
 
     fn seal_command(&mut self) -> Result<(), Error> {
@@ -226,6 +259,7 @@ impl<F: Fs> Writer<F> {
         body: &[u8],
         total: u64,
         preallocate: u64,
+        announce: bool,
     ) -> Result<Written, Error> {
         if self.active.as_ref().is_some_and(|a| !fits(a.end, total)) {
             self.seal()?;
@@ -266,10 +300,17 @@ impl<F: Fs> Writer<F> {
             active.dir_synced = true;
         }
         active.end = offset + total;
-        Ok(Written {
+        let written = Written {
             segment: active.segment,
             offset,
-        })
+        };
+        if announce
+            && let Some(hook) = &self.hook
+            && hook.send((written.segment, offset, bytes)).is_err()
+        {
+            self.hook = None;
+        }
+        Ok(written)
     }
 
     fn open_segment(&mut self, first: u64, preallocate: u64) -> Result<Active<F::File>, Error> {

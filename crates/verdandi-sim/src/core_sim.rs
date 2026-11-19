@@ -492,12 +492,11 @@ impl Sim {
             .map(|g| (*g, self.available(group, selector).into_iter().collect()));
         if !self.generation.contains_key(group) {
             let used = self.used(group);
-            let incarnation = INC + self.restarts;
             let reserved = self.reserved.entry(group.to_owned()).or_default();
             *reserved = (*reserved).max(used + 1);
             let created = Generation {
                 counter: *reserved,
-                incarnation,
+                incarnation: 0,
             };
             self.generation.insert(group.to_owned(), created);
             self.forgetting.remove(group);

@@ -1,0 +1,6 @@
+apiVersion: v2
+name: verdandi
+description: Verdandi pub/sub queue cluster
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

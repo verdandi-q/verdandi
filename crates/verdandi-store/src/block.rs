@@ -117,8 +117,23 @@ pub fn decode_block(data: &[u8], offset: u64) -> Result<(BlockHeader, &[u8]), Ba
     Ok((header, body))
 }
 
+pub fn decode_bytes(block: &[u8], offset: u64) -> Result<(BlockHeader, &[u8]), Bad> {
+    let (header, version, body) = parse_at(block, 0, offset)?;
+    if version != VERSION {
+        return Err(Bad::UnknownVersion(version));
+    }
+    if block.len() != BLOCK_HEADER_LEN + body.len() {
+        return Err(Bad::Damaged);
+    }
+    Ok((header, body))
+}
+
 pub(crate) fn parse_block(data: &[u8], offset: u64) -> Result<(BlockHeader, u16, &[u8]), Bad> {
     let start = usize::try_from(offset).map_err(|_| Bad::Damaged)?;
+    parse_at(data, start, offset)
+}
+
+fn parse_at(data: &[u8], start: usize, offset: u64) -> Result<(BlockHeader, u16, &[u8]), Bad> {
     let h = data
         .get(start..start + BLOCK_HEADER_LEN)
         .ok_or(Bad::Damaged)?;

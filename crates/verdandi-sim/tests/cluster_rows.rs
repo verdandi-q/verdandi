@@ -645,7 +645,7 @@ fn a_copy_that_no_holder_set_names_does_not_count() {
         let mut holders = group.clone();
         holders.push(x);
         let id = w.place(&holders, SEGMENT_BYTES);
-        w.kill(x);
+        w.stop(x);
         w.advance(20_000);
         assert!(!w.segments[&id].holders.holders.contains(&x), "seed {seed}");
         assert!(w.boot(x, 1));
@@ -676,7 +676,7 @@ fn the_repair_check_refuses_a_live_copy_that_no_holder_set_names() {
         .expect("a node outside the group");
     let mut holders = group.clone();
     holders.push(x);
-    w.place(&holders, SEGMENT_BYTES);
+    let id = w.place(&holders, SEGMENT_BYTES);
     let cuts: Vec<(u64, u64)> = w
         .running()
         .into_iter()
@@ -684,8 +684,11 @@ fn the_repair_check_refuses_a_live_copy_that_no_holder_set_names() {
         .map(|d| pair(d, x))
         .collect();
     w.cut(&cuts);
-    w.advance(20_000);
-    for d in &group {
+    w.advance(50_000);
+    let mut gone = w.segments[&id].holders.holders.clone();
+    gone.extend(group.iter().copied());
+    gone.remove(&x);
+    for d in &gone {
         w.delete(*d);
     }
     w.repaired();
@@ -1807,10 +1810,13 @@ fn a_planned_holder_with_no_live_complete_copy_names_the_segment_lost() {
     let n = w.start(4, 3, OLD);
     warm(&mut w);
     let id = w.place(&[n[0]], SEGMENT_BYTES);
-    w.advance(STEP_MS);
-    while !w.now_ms.is_multiple_of(5_000) {
+    for _ in 0..200 {
         w.advance(STEP_MS);
+        if w.copying_to(id) {
+            break;
+        }
     }
+    assert!(w.copying_to(id));
     assert!(w.named_lost.is_empty());
     w.kill(n[0]);
     w.advance(STEP_MS);

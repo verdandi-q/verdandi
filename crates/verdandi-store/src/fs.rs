@@ -1,7 +1,10 @@
+use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 use rustix::fs::FallocateFlags;
 
@@ -35,6 +38,41 @@ pub trait Fs: Send + Sync + 'static {
     fn statfs(&self, path: &Path) -> io::Result<FsStat>;
 }
 
+static SYNCS: Mutex<(u64, BTreeMap<u64, Instant>)> = Mutex::new((0, BTreeMap::new()));
+
+pub struct Syncing(u64);
+
+impl Syncing {
+    pub fn begin() -> Syncing {
+        let mut syncs = SYNCS.lock().unwrap_or_else(|e| e.into_inner());
+        syncs.0 += 1;
+        let id = syncs.0;
+        syncs.1.insert(id, Instant::now());
+        Syncing(id)
+    }
+}
+
+impl Drop for Syncing {
+    fn drop(&mut self) {
+        SYNCS
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .remove(&self.0);
+    }
+}
+
+pub fn write_stuck_for() -> Duration {
+    SYNCS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .1
+        .values()
+        .map(Instant::elapsed)
+        .max()
+        .unwrap_or_default()
+}
+
 #[derive(Clone, Copy, Debug, Default)]
 pub struct RealFs;
 
@@ -46,10 +84,12 @@ impl FsFile for RealFile {
     }
 
     fn write_at(&self, buf: &[u8], offset: u64) -> io::Result<()> {
+        let _syncing = Syncing::begin();
         self.0.write_all_at(buf, offset)
     }
 
     fn allocate(&self, len: u64) -> io::Result<()> {
+        let _syncing = Syncing::begin();
         Ok(rustix::fs::fallocate(
             &self.0,
             FallocateFlags::empty(),
@@ -63,6 +103,7 @@ impl FsFile for RealFile {
     }
 
     fn sync_data(&self) -> io::Result<()> {
+        let _syncing = Syncing::begin();
         self.0.sync_data()
     }
 
@@ -89,6 +130,7 @@ impl Fs for RealFs {
     }
 
     fn sync_dir(&self, dir: &Path) -> io::Result<()> {
+        let _syncing = Syncing::begin();
         File::open(dir)?.sync_all()
     }
 

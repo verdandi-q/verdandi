@@ -298,7 +298,7 @@ impl Meta {
         self.version += 1;
     }
 
-    fn encode(&self) -> Vec<u8> {
+    pub fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         put(&mut out, [self.version, self.shape]);
         put_list(&mut out, self.members.iter().copied());
@@ -331,7 +331,7 @@ impl Meta {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Option<Meta> {
+    pub fn decode(bytes: &[u8]) -> Option<Meta> {
         let mut rest = bytes;
         let [version, shape] = words(&mut rest)?;
         let mut meta = Meta {
@@ -634,6 +634,20 @@ impl Control {
 
     pub fn learners(&self) -> &[u64] {
         &self.conf.learners
+    }
+
+    pub fn campaign(&mut self) -> raft::Result<()> {
+        self.node.campaign()
+    }
+
+    pub fn caught_up(&self, id: u64) -> bool {
+        self.is_leader()
+            && self
+                .node
+                .raft
+                .prs()
+                .get(id)
+                .is_some_and(|p| p.matched >= self.node.raft.raft_log.committed)
     }
 
     pub fn pending_conf(&self) -> bool {

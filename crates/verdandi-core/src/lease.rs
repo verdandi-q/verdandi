@@ -1,15 +1,25 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::str::FromStr;
 
 use crate::group::Hold;
-use crate::ids::{Address, MessageId, ParseIdError};
+use crate::ids::{Address, MessageId, ParseIdError, SegmentId};
 use crate::{Action, Core, DeadCopy, Generation, MAX_DELAY_MS, Reason, Record, SECOND_MS, names};
 
 pub const MAX_BACKOFF_MS: u64 = 300 * SECOND_MS;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Receipt(pub u128);
+
+impl Receipt {
+    pub fn new(issuer: u64, random: u64) -> Self {
+        Self(u128::from(issuer) << 64 | u128::from(random))
+    }
+
+    pub fn issuer(self) -> u64 {
+        (self.0 >> 64) as u64
+    }
+}
 
 impl fmt::Display for Receipt {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -196,6 +206,29 @@ impl Core {
         )
     }
 
+    pub fn set_led(&mut self, segments: BTreeSet<SegmentId>) -> Vec<Action> {
+        let old = self.led.replace(segments.clone()).unwrap_or_default();
+        for lost in old.difference(&segments) {
+            self.drop_leases(*lost);
+        }
+        if segments.is_subset(&old) {
+            return Vec::new();
+        }
+        let groups: Vec<String> = self.waiters.keys().cloned().collect();
+        groups.iter().flat_map(|g| self.wake_all(g)).collect()
+    }
+
+    pub fn drop_leases(&mut self, segment: SegmentId) {
+        for lease in self.leases.values_mut() {
+            lease.ids.retain(|_, (at, _)| at.segment != segment);
+        }
+        self.leases.retain(|_, l| !l.ids.is_empty());
+        for mem in self.mem.values_mut() {
+            mem.holds
+                .retain(|at, hold| at.segment != segment || !matches!(hold, Hold::Leased(_)));
+        }
+    }
+
     pub fn release(&mut self, receipt: Receipt, ids: &[MessageId]) -> Vec<Action> {
         let Some(lease) = self.leases.get_mut(&receipt) else {
             return Vec::new();
@@ -358,6 +391,17 @@ impl Core {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_receipt_keeps_its_issuer_through_the_text_form() {
+        let receipt = Receipt::new(u64::MAX - 2, 77);
+        let text = receipt.to_string();
+        assert_eq!(text.len(), 34);
+        let parsed: Receipt = text.parse().unwrap();
+        assert_eq!(parsed, receipt);
+        assert_eq!(parsed.issuer(), u64::MAX - 2);
+        assert_eq!(Receipt::new(0, 5).to_string(), format!("r_{:032x}", 5));
+    }
     use crate::testkit::*;
     use crate::{MAX_FAILURES, Timing};
 

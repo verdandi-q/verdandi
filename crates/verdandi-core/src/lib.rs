@@ -211,6 +211,7 @@ pub struct Core {
     state: State,
     mem: BTreeMap<String, GroupMem>,
     leases: BTreeMap<Receipt, Lease>,
+    led: Option<BTreeSet<SegmentId>>,
     waiters: BTreeMap<String, VecDeque<(WaiterId, String)>>,
     next_waiter: u64,
 }
@@ -223,6 +224,7 @@ impl Core {
             state: State::default(),
             mem: BTreeMap::new(),
             leases: BTreeMap::new(),
+            led: None,
             waiters: BTreeMap::new(),
             next_waiter: 0,
         }

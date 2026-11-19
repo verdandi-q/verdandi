@@ -28,7 +28,6 @@ const BODY_MAX: usize = 16 << 20;
 const MESSAGE_MAX: usize = 1 << 20;
 const HEADERS_MAX: usize = 8 << 10;
 const BODY_TIMEOUT: Duration = Duration::from_secs(60);
-const COPIES: u32 = 1;
 const FORM: &str = "application/x-www-form-urlencoded";
 const ROOM: usize = MAX_BLOCK - BLOCK_HEADER_LEN;
 
@@ -220,7 +219,7 @@ async fn send(
     };
     let reply = Published {
         ids,
-        copies: COPIES,
+        copies: published.copies,
         next: Next {
             take: format!("/s/{stream}?group={{group}}"),
         },

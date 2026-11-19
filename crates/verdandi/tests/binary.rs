@@ -15,11 +15,7 @@ use tokio::runtime::Runtime;
 use verdandi_http::OPEN_MODE;
 
 const URL: &str = "http://127.0.0.1:8080";
-const CLUSTER: [&str; 3] = [
-    "VERDANDI_CLUSTER_KEY",
-    "VERDANDI_CLUSTER_URL",
-    "VERDANDI_BACKUP_URL",
-];
+const CLUSTER: [&str; 2] = ["VERDANDI_CLUSTER_KEY", "VERDANDI_CLUSTER_URL"];
 
 static PORT: Mutex<()> = Mutex::new(());
 
@@ -169,7 +165,7 @@ fn open_mode_warns_on_stderr_and_in_get_root_at_each_start() {
 }
 
 #[test]
-fn open_mode_refuses_to_start_with_a_cluster_or_backup_variable() {
+fn open_mode_refuses_to_start_with_a_cluster_variable() {
     let _port = port();
     let dir = scratch();
     for name in CLUSTER {
@@ -179,6 +175,23 @@ fn open_mode_refuses_to_start_with_a_cluster_or_backup_variable() {
         let stderr = running.stderr();
         assert!(stderr.contains(name), "{stderr}");
         assert!(!stderr.contains(OPEN_MODE), "{stderr}");
+    }
+    assert!(!dir.path().join("data").exists());
+}
+
+#[test]
+fn a_bad_backup_url_stops_the_start_and_names_the_variable() {
+    let _port = port();
+    let dir = scratch();
+    for bad in ["x", "ftp://host/path"] {
+        let mut running = spawn(dir.path(), &[("VERDANDI_BACKUP_URL", bad)]);
+        let status = running.exit();
+        assert!(!status.success(), "{bad}: {status}");
+        let stderr = running.stderr();
+        assert!(
+            stderr.contains("VERDANDI_BACKUP_URL is not valid"),
+            "{stderr}"
+        );
     }
     assert!(!dir.path().join("data").exists());
 }
@@ -460,4 +473,109 @@ fn sigkill_restart_keeps_every_201_id_and_redelivers_every_unacked_one() {
         .collect();
     let missing: Vec<_> = unacked.difference(&redelivered).collect();
     assert!(missing.is_empty(), "unacked ids not delivered: {missing:?}");
+}
+
+const KEY: &str = "0123456789abcdef0123456789abcdef";
+
+fn spawn_node(dir: &Path, url: &str, ip: &str) -> Running {
+    let log = std::fs::File::create(dir.join("stderr.log")).expect("log file");
+    let child = Command::new(env!("CARGO_BIN_EXE_verdandi"))
+        .current_dir(dir)
+        .env("VERDANDI_CLUSTER_KEY", KEY)
+        .env("VERDANDI_CLUSTER_URL", url)
+        .env("POD_IP", ip)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("spawn the binary");
+    Running(child)
+}
+
+async fn status(http: &Client, ip: &str) -> Option<(u64, Option<u64>, BTreeSet<u64>)> {
+    let reply = http
+        .get(format!("http://{ip}:8080/s/_vd.status"))
+        .timeout(Duration::from_secs(2))
+        .send()
+        .await
+        .ok()?;
+    let body: Value = serde_json::from_slice(&reply.bytes().await.ok()?).ok()?;
+    let members = body["members"].as_array()?.iter().filter_map(Value::as_u64);
+    Some((
+        body["id"].as_u64()?,
+        body["leader"].as_u64(),
+        members.collect(),
+    ))
+}
+
+async fn until<T>(what: &str, secs: u64, mut probe: impl AsyncFnMut() -> Option<T>) -> T {
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    loop {
+        if let Some(found) = probe().await {
+            return found;
+        }
+        assert!(Instant::now() < deadline, "timeout: {what}");
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+}
+
+#[test]
+fn three_processes_form_one_cluster_and_one_leaves_on_sigterm() {
+    let _port = port();
+    let rt = runtime();
+    let dirs = [scratch(), scratch(), scratch()];
+    let ips = ["127.0.0.1", "127.0.0.2", "127.0.0.3"];
+    let url = format!("http://{}:8080", ips[0]);
+    let mut nodes: Vec<Running> = (0..3)
+        .map(|i| spawn_node(dirs[i].path(), &url, ips[i]))
+        .collect();
+    let client = Client::new();
+    let logs = || {
+        dirs.iter()
+            .map(|d| std::fs::read_to_string(d.path().join("stderr.log")).unwrap_or_default())
+            .collect::<Vec<_>>()
+            .join("\n-----\n")
+    };
+    let ids = rt.block_on(until("three members and one leader", 150, async || {
+        let mut all = Vec::new();
+        for ip in &ips {
+            all.push(status(&client, ip).await?);
+        }
+        let ids: BTreeSet<u64> = all.iter().map(|s| s.0).collect();
+        let leader = all[0].1?;
+        let one = all.iter().all(|s| s.1 == Some(leader) && s.2 == ids);
+        (ids.len() == 3 && ids.contains(&leader) && one).then_some((ids, leader, all))
+    }));
+    let (ids, leader, all) = ids;
+    let Some(at) = all.iter().position(|s| s.0 != leader) else {
+        panic!("no follower\n{}", logs());
+    };
+    let gone = all[at].0;
+    let pid = nodes[at].0.id().to_string();
+    let signalled = Command::new("kill").args(["-TERM", &pid]).status();
+    assert!(signalled.expect("kill").success());
+    let deadline = Instant::now() + Duration::from_secs(150);
+    let exit = loop {
+        if let Some(status) = nodes[at].0.try_wait().expect("try wait") {
+            break status;
+        }
+        assert!(Instant::now() < deadline, "no exit\n{}", logs());
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert!(exit.success(), "{exit}\n{}", logs());
+    let rest: BTreeSet<u64> = ids.iter().copied().filter(|i| *i != gone).collect();
+    rt.block_on(until("the node left Meta.members", 60, async || {
+        for ip in ips
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| *i != at)
+            .map(|(_, p)| p)
+        {
+            let s = status(&client, ip).await?;
+            if s.2 != rest {
+                return None;
+            }
+        }
+        Some(())
+    }));
 }

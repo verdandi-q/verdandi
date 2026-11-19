@@ -25,6 +25,10 @@ impl Bitmap {
             .get(position as usize / 64)
             .is_some_and(|w| (w >> (position % 64)) & 1 == 1)
     }
+
+    fn positions(&self) -> impl Iterator<Item = u32> + '_ {
+        (0..self.0.len() as u32 * 64).filter(|p| self.get(*p))
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord)]
@@ -265,6 +269,13 @@ impl Core {
             };
             let tombstone = self.state.tombstone(stream);
             for start in starts.values() {
+                if self
+                    .led
+                    .as_ref()
+                    .is_some_and(|led| !led.contains(&start.segment))
+                {
+                    continue;
+                }
                 let Some(chunk) = self.state.chunks.get(start) else {
                     continue;
                 };
@@ -318,7 +329,7 @@ impl Core {
         mem.reserved = mem.reserved.max(used + 1);
         let generation = Generation {
             counter: mem.reserved,
-            incarnation: self.incarnation,
+            incarnation: 0,
         };
         self.adopt(group, generation, now);
         generation
@@ -557,6 +568,67 @@ impl Core {
             .collect()
     }
 
+    pub fn snapshot(&self) -> Vec<Record> {
+        let mut out = Vec::new();
+        for (name, g) in &self.state.groups {
+            let group = || name.clone();
+            if let Some(generation) = g.forgotten {
+                out.push(Record::Forget {
+                    group: group(),
+                    generation,
+                    provisional: false,
+                });
+            }
+            let Some(generation) = g.generation else {
+                continue;
+            };
+            out.push(Record::Generation {
+                group: group(),
+                generation,
+                from: g.from.unwrap_or(Bound::Unbounded),
+                issued: false,
+            });
+            for (stream, up_to) in &g.redrive {
+                out.push(Record::Redrive {
+                    group: group(),
+                    generation,
+                    stream: stream.clone(),
+                    up_to: *up_to,
+                });
+            }
+            for (selector, generation) in &g.read_set {
+                out.push(Record::ReadSet {
+                    group: group(),
+                    generation: *generation,
+                    selector: selector.clone(),
+                });
+            }
+            for (segment, bits) in &g.acked {
+                for position in bits.positions() {
+                    let address = Address {
+                        segment: *segment,
+                        position,
+                    };
+                    if let Some((_, stream)) = self.state.message_at(address) {
+                        out.push(Record::Ack {
+                            group: group(),
+                            generation,
+                            address,
+                            stream: stream.to_owned(),
+                        });
+                    }
+                }
+            }
+        }
+        for (stream, up_to) in &self.state.tombstones {
+            out.push(Record::Tombstone {
+                stream: stream.clone(),
+                up_to: *up_to,
+            });
+        }
+        out
+    }
+
     pub fn forget(&self, group: &str) -> Option<Record> {
         Some(Record::Forget {
             group: group.to_owned(),
@@ -707,6 +779,7 @@ pub struct GroupStats {
     pub dead: u64,
     pub oldest_ms: Option<u64>,
     pub provisional: bool,
+    pub settled_60s: u64,
 }
 
 impl Core {
@@ -726,6 +799,7 @@ impl Core {
             dead: 0,
             oldest_ms: None,
             provisional: g.acked_gen.is_none(),
+            settled_60s: 0,
         };
         for (stream, starts) in &self.state.streams {
             let reads = selectors.iter().any(|s| names::matches(s, stream));
@@ -881,7 +955,33 @@ mod tests {
             ids(&take(&mut core, "b", "s", 10, 2, 4)),
             [id(1, 0), id(1, 1), id(2, 0)]
         );
-        assert_eq!(core.generation("b").map(|g| g.incarnation), Some(INC));
+        assert_eq!(core.generation("b").map(|g| g.incarnation), Some(0));
+    }
+
+    #[test]
+    fn two_nodes_that_create_a_group_at_once_keep_every_ack() {
+        let mut a = Core::new(INC);
+        let mut b = Core::new(INC + 1);
+        for core in [&mut a, &mut b] {
+            publish(core, "s", addr(1, 0), 1, 2);
+        }
+        take(&mut a, "g", "s", 2, 1, 2);
+        take(&mut b, "g", "s", 1, 2, 2);
+        let mut records = Vec::new();
+        for (core, receipt) in [(&mut a, 1), (&mut b, 2)] {
+            for action in core.ack_all(Receipt(receipt), 3).unwrap() {
+                let Action::Write(record) = action else {
+                    continue;
+                };
+                records.push(record);
+            }
+        }
+        for core in [&mut a, &mut b] {
+            for record in &records {
+                core.apply(record.clone(), 4);
+            }
+            assert!(take(core, "g", "s", 10, 9, 5).is_empty());
+        }
     }
 
     #[test]

@@ -695,6 +695,10 @@ impl World {
         }
     }
 
+    pub fn copying_to(&self, id: u64) -> bool {
+        self.copying.keys().any(|(segment, _)| *segment == id)
+    }
+
     pub fn kill(&mut self, disk: u64) {
         self.record(disk, LossKind::Kill);
         self.down(disk);
@@ -1120,8 +1124,17 @@ impl World {
     }
 
     pub fn accept_loss_from(&mut self, origin: u64, disk: u64) -> bool {
-        let effects = self.step_node(origin, self.now_ms, vec![Cmd::AcceptLoss { disk }]);
-        effects.iter().any(|e| matches!(e, Effect::Accepted(true)))
+        for _ in 0..=REPLACE_MS / STEP_MS {
+            let effects = self.step_node(origin, self.now_ms, vec![Cmd::AcceptLoss { disk }]);
+            if effects.iter().any(|e| matches!(e, Effect::Accepted(true))) {
+                return true;
+            }
+            if !self.nodes.get(&origin).is_some_and(|n| n.view.absent(disk)) {
+                return false;
+            }
+            self.step(STEP_MS);
+        }
+        false
     }
 
     fn serving(&self, disk: u64) -> bool {

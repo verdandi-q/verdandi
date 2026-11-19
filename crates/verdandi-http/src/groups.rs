@@ -9,12 +9,14 @@ use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
 use utoipa::ToSchema;
+use verdandi_core::group::GroupStats;
 use verdandi_core::ids::MessageId;
 use verdandi_core::names;
 
 use crate::error::{ErrorBody, Fail, NAMES};
 use crate::publish::{read, time_ms};
 use crate::{Node, ready};
+use verdandi_store::engine::DRAIN_S;
 
 const PUT_BODY: &str = r#"send {"from": time, "-7d", "now" or a message id} to replay, or {"redrive": "dead"} to deliver dead letters again"#;
 
@@ -24,6 +26,16 @@ const PUT_BODY: &str = r#"send {"from": time, "-7d", "now" or a message id} to r
 struct Request {
     from: Option<String>,
     redrive: Option<String>,
+}
+
+const TARGET_S: f64 = 60.0;
+
+pub(crate) fn drain_rate(stats: &GroupStats) -> f64 {
+    stats.settled_60s as f64 / DRAIN_S as f64
+}
+
+fn desired_consumers(stats: &GroupStats) -> u64 {
+    (stats.pending as f64 / (drain_rate(stats) * TARGET_S).max(1.0)).ceil() as u64
 }
 
 fn name(path: Result<Path<String>, PathRejection>) -> Result<String, Fail> {
@@ -40,7 +52,7 @@ fn name(path: Result<Path<String>, PathRejection>) -> Result<String, Fail> {
     summary = "Show the count of work of a group",
     params(("group" = String, Path, description = "The group name")),
     responses(
-        (status = 200, description = "The counts", body = Object, example = json!({"pending": 0, "in_flight": 0, "dead": 0, "oldest_age_s": 0.0, "provisional": false})),
+        (status = 200, description = "The counts", body = Object, example = json!({"pending": 0, "in_flight": 0, "dead": 0, "oldest_age_s": 0.0, "drain_rate": 0.0, "desired_consumers": 0, "provisional": false})),
         (status = 400, description = "The request is not valid", body = ErrorBody),
         (status = 403, description = "The Host is not an IP address or localhost", body = ErrorBody),
         (status = 404, description = "The group does not exist", body = ErrorBody),
@@ -68,6 +80,8 @@ pub async fn stats(
         "in_flight": stats.in_flight,
         "dead": stats.dead,
         "oldest_age_s": oldest_age_s,
+        "drain_rate": drain_rate(&stats),
+        "desired_consumers": desired_consumers(&stats),
         "provisional": stats.provisional,
     }))
     .into_response())

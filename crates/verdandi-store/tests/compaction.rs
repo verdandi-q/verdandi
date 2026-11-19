@@ -1206,3 +1206,99 @@ fn the_write_rate_counts_every_byte_of_the_log_blocks_and_of_the_compaction_outp
     assert_eq!(status.write_bytes_per_s, written * 1000 / 60_000);
     stop(&rt, node).expect("clean stop");
 }
+
+#[test]
+fn an_open_replica_segment_is_not_compacted() {
+    let rt = runtime();
+    let clock = TestClock::new(1_000_000);
+    let (fs_a, fs_b) = (FaultFs::new(5, 1 << 40), FaultFs::new(6, 1 << 40));
+    let a = boot(&rt, &fs_a, &clock);
+    let mut hook = rt.block_on(a.handle.subscribe()).expect("subscribe");
+    for value in [&[b'a'; 4096][..], b"b", b"c"] {
+        publish(&rt, &a, "s", value);
+    }
+    let b = boot(&rt, &fs_b, &clock);
+    while let Ok((id, offset, bytes)) = hook.try_recv() {
+        rt.block_on(b.handle.replicate(id, offset, bytes))
+            .expect("replicate");
+    }
+    let (receipt, before) = take(&rt, &b, "g", "s");
+    assert_eq!(before.len(), 3);
+    ack(&rt, &b, receipt, &[before[0].0]);
+    clock.advance(IDLE_SEAL_MS + RETAIN_MS);
+    rt.block_on(b.handle.damage()).expect("a tick");
+    compact(&rt, &b, &clock);
+    assert_eq!(values(&blocks(&fs_b)).len(), 3);
+    stop(&rt, b).expect("stop b");
+    stop(&rt, a).expect("stop a");
+}
+
+#[test]
+fn an_open_foreign_replica_is_not_compacted_after_a_restart_of_the_holder() {
+    let rt = runtime();
+    let clock = TestClock::new(1_000_000);
+    let (fs_a, fs_b) = (FaultFs::new(5, 1 << 40), FaultFs::new(6, 1 << 40));
+    let a = boot(&rt, &fs_a, &clock);
+    let mut hook = rt.block_on(a.handle.subscribe()).expect("subscribe");
+    for value in [&[b'a'; 4096][..], b"b", b"c"] {
+        publish(&rt, &a, "s", value);
+    }
+    let b = boot(&rt, &fs_b, &clock);
+    while let Ok((id, offset, bytes)) = hook.try_recv() {
+        rt.block_on(b.handle.replicate(id, offset, bytes))
+            .expect("replicate");
+    }
+    stop(&rt, b).expect("stop b");
+    let b = boot(&rt, &fs_b, &clock);
+    let open: std::collections::BTreeSet<_> = rt
+        .block_on(b.handle.segments())
+        .expect("segments")
+        .into_iter()
+        .collect();
+    assert!(!open.is_empty());
+    rt.block_on(b.handle.open_foreign(open)).expect("open");
+    let (receipt, before) = take(&rt, &b, "g", "s");
+    assert_eq!(before.len(), 3);
+    ack(&rt, &b, receipt, &[before[0].0]);
+    clock.advance(IDLE_SEAL_MS + RETAIN_MS);
+    rt.block_on(b.handle.damage()).expect("a tick");
+    compact(&rt, &b, &clock);
+    assert_eq!(values(&blocks(&fs_b)).len(), 3);
+    stop(&rt, b).expect("stop b");
+    stop(&rt, a).expect("stop a");
+}
+
+#[test]
+fn a_snapshot_gives_a_replica_the_control_records_that_it_missed() {
+    let rt = runtime();
+    let clock = TestClock::new(1_000_000);
+    let (fs_a, fs_b) = (FaultFs::new(5, 1 << 40), FaultFs::new(6, 1 << 40));
+    let a = boot(&rt, &fs_a, &clock);
+    let mut hook = rt.block_on(a.handle.subscribe()).expect("subscribe");
+    for value in [b"a", b"b", b"c"] {
+        publish(&rt, &a, "s", value);
+    }
+    let b = boot(&rt, &fs_b, &clock);
+    while let Ok((id, offset, bytes)) = hook.try_recv() {
+        rt.block_on(b.handle.replicate(id, offset, bytes))
+            .expect("replicate");
+    }
+    let (receipt, got) = take(&rt, &a, "g", "s");
+    assert_eq!(got.len(), 3);
+    ack(&rt, &a, receipt, &[got[0].0]);
+    assert!(
+        rt.block_on(b.handle.group_stats("g".to_owned()))
+            .expect("stats")
+            .is_none()
+    );
+    let snapshot = rt.block_on(a.handle.snapshot()).expect("snapshot");
+    rt.block_on(b.handle.controls(0, snapshot))
+        .expect("controls");
+    let stats = rt
+        .block_on(b.handle.group_stats("g".to_owned()))
+        .expect("stats")
+        .expect("the group is known");
+    assert_eq!(stats.pending, 2);
+    stop(&rt, b).expect("stop b");
+    stop(&rt, a).expect("stop a");
+}

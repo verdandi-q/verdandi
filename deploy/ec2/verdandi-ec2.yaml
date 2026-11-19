@@ -1,0 +1,220 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Verdandi cluster on an EC2 auto scaling group
+Parameters:
+  ImageUri:
+    Type: String
+  AmiId:
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+    Default: /aws/service/ami-amazon-linux-latest/al2023-ami-kernel-default-x86_64
+  InstanceType:
+    Type: String
+    Default: m6i.large
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3:
+    Type: AWS::EC2::Subnet::Id
+  ClientCidr:
+    Type: String
+    Description: Address range of the clients. They reach the load balancer on port 80.
+  ClusterKeyParameter:
+    Type: String
+    Description: Name of the SSM SecureString parameter, without a leading slash, that holds the cluster key. Run verdandi keygen to make one.
+  BackupUrl:
+    Type: String
+    Default: ""
+  DesiredCapacity:
+    Type: Number
+    Default: 3
+    MinValue: 1
+  MinInServiceDuringUpdate:
+    Type: Number
+    Default: 2
+    Description: Set it to one less than DesiredCapacity. The update stops one instance, then starts its replacement.
+  ReadyGraceSeconds:
+    Type: Number
+    Default: 900
+Conditions:
+  HasBackup: !Not [!Equals [!Ref BackupUrl, ""]]
+Resources:
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: boot
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub "arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${ClusterKeyParameter}"
+              - Effect: Allow
+                Action: cloudformation:SignalResource
+                Resource: !Sub "arn:${AWS::Partition}:cloudformation:${AWS::Region}:${AWS::AccountId}:stack/${AWS::StackName}/*"
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref InstanceRole
+  LoadBalancerGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Verdandi load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref ClientCidr
+  InstanceGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Verdandi instances
+      VpcId: !Ref VpcId
+  FromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref InstanceGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref LoadBalancerGroup
+  PeerHttp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref InstanceGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref InstanceGroup
+  PeerLink:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref InstanceGroup
+      IpProtocol: tcp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref InstanceGroup
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref LoadBalancerGroup
+      Subnets:
+        - !Ref Subnet1
+        - !Ref Subnet2
+        - !Ref Subnet3
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 8080
+      TargetType: instance
+      HealthCheckPath: /readyz
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "120"
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+  LaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateData:
+        ImageId: !Ref AmiId
+        InstanceType: !Ref InstanceType
+        IamInstanceProfile:
+          Arn: !GetAtt InstanceProfile.Arn
+        SecurityGroupIds:
+          - !Ref InstanceGroup
+        MetadataOptions:
+          HttpEndpoint: enabled
+          HttpTokens: required
+          HttpPutResponseHopLimit: 2
+        UserData:
+          Fn::Base64: !Sub
+            - |
+              #!/bin/bash
+              set -euo pipefail
+              dnf install -y docker aws-cfn-bootstrap
+              systemctl enable --now docker
+              mkdir -p /var/lib/verdandi
+              chown 10001:10001 /var/lib/verdandi
+              TOKEN=$(curl -s -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+              IP=$(curl -s -H "X-aws-ec2-metadata-token: $TOKEN" http://169.254.169.254/latest/meta-data/local-ipv4)
+              KEY=$(aws ssm get-parameter --region ${AWS::Region} --name ${ClusterKeyParameter} --with-decryption --query Parameter.Value --output text)
+              umask 077
+              printf 'VERDANDI_CLUSTER_KEY=%s\n' "$KEY" > /etc/verdandi.env
+              unset KEY
+              docker run -d --name verdandi --restart unless-stopped --stop-timeout 120 \
+                --network host -v /var/lib/verdandi:/data \
+                --env-file /etc/verdandi.env -e POD_IP="$IP" \
+                -e VERDANDI_CLUSTER_URL=http://${LoadBalancer.DNSName} ${BackupFlag} \
+                ${ImageUri}
+              until curl -fs "http://$IP:8080/readyz"; do sleep 5; done
+              cfn-signal -e 0 --stack ${AWS::StackName} --resource Group --region ${AWS::Region}
+            - BackupFlag: !If [HasBackup, !Sub "-e VERDANDI_BACKUP_URL=${BackupUrl}", ""]
+  Group:
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn: Listener
+    CreationPolicy:
+      ResourceSignal:
+        Count: !Ref DesiredCapacity
+        Timeout: PT30M
+    UpdatePolicy:
+      AutoScalingRollingUpdate:
+        MaxBatchSize: 1
+        MinInstancesInService: !Ref MinInServiceDuringUpdate
+        PauseTime: PT30M
+        WaitOnResourceSignals: true
+        SuspendProcesses:
+          - HealthCheck
+          - ReplaceUnhealthy
+          - AZRebalance
+          - AlarmNotification
+          - ScheduledActions
+    Properties:
+      MinSize: !Ref DesiredCapacity
+      MaxSize: !Ref DesiredCapacity
+      DesiredCapacity: !Ref DesiredCapacity
+      VPCZoneIdentifier:
+        - !Ref Subnet1
+        - !Ref Subnet2
+        - !Ref Subnet3
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: !Ref ReadyGraceSeconds
+      TargetGroupARNs:
+        - !Ref TargetGroup
+      LaunchTemplate:
+        LaunchTemplateId: !Ref LaunchTemplate
+        Version: !GetAtt LaunchTemplate.LatestVersionNumber
+      LifecycleHookSpecificationList:
+        - LifecycleHookName: verdandi-stop
+          LifecycleTransition: autoscaling:EC2_INSTANCE_TERMINATING
+          HeartbeatTimeout: 150
+          DefaultResult: CONTINUE
+Outputs:
+  Url:
+    Value: !Sub "http://${LoadBalancer.DNSName}"

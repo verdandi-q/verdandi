@@ -1,7 +1,10 @@
 use axum::Json;
+use std::sync::Arc;
+
 use axum::body::Body;
 use axum::extract::rejection::PathRejection;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
+use axum::http::{HeaderMap, Method};
 use axum::response::{IntoResponse, Response};
 use serde::Deserialize;
 use serde_json::json;
@@ -12,8 +15,9 @@ use verdandi_store::engine::{Error, SettleBy};
 
 use crate::error::{ErrorBody, Fail, full};
 use crate::publish::{list, read};
+use crate::route::Route;
 use crate::take::{LEASE_MAX_S, capped, seconds};
-use crate::{Node, ready};
+use crate::{Cluster, Node, ready};
 
 const LOGGED_IDS: usize = 10;
 
@@ -65,12 +69,18 @@ struct DeadRequest {
 )]
 pub async fn settle(
     State(node): State<Node>,
+    cluster: Option<Extension<Arc<Cluster>>>,
+    headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
     body: Body,
 ) -> Result<Response, Fail> {
     let handle = ready(&node)?;
+    let route = Route::of(cluster, &headers)?;
     let receipt = receipt(path)?;
     let body = read(body).await?;
+    if let Some(route) = route.filter(|route| route.foreign(receipt)) {
+        return route.settle(receipt, Method::POST, body).await;
+    }
     let request: Request = serde_json::from_slice(&body).map_err(|e| {
         Fail::bad(
             e.to_string(),
@@ -142,10 +152,18 @@ pub async fn settle(
 )]
 pub async fn ack_all(
     State(node): State<Node>,
+    cluster: Option<Extension<Arc<Cluster>>>,
+    headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
 ) -> Result<Response, Fail> {
     let handle = ready(&node)?;
+    let route = Route::of(cluster, &headers)?;
     let receipt = receipt(path)?;
+    if let Some(route) = route.filter(|route| route.foreign(receipt)) {
+        return route
+            .settle(receipt, Method::DELETE, Default::default())
+            .await;
+    }
     handle.settle(receipt, SettleBy::All).await?;
     tracing::info!(%receipt, kinds = %"ack_all", ids = %"", "settle");
     Ok(Json(json!({})).into_response())

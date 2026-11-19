@@ -12,7 +12,7 @@ use verdandi_core::cluster::placement::{self, Candidate, Groups, HolderSet};
 use verdandi_core::cluster::repair::{self, Held, Want};
 use verdandi_core::cluster::steer::{self, Hold};
 use verdandi_core::cluster::view::{
-    Body, GOSSIP_MS, HEARTBEAT_MS, Head, JOIN_MS, LIFECYCLE, SIGTERM, STOP_BUDGET_MS, State,
+    Body, GOSSIP_MS, HEARTBEAT_MS, Head, JOIN_MS, LIFECYCLE, Line, SIGTERM, STOP_BUDGET_MS, State,
     TOMBSTONE_HORIZON, Update, View,
 };
 
@@ -27,11 +27,12 @@ pub enum Cause {
 
 pub const FENCE_MS: u64 = 1_500;
 pub const STEP_MS: u64 = HEARTBEAT_MS;
+const GOVERN_CHANGES: usize = 32;
 pub const HEARD_MS: u64 = 10 * STEP_MS;
 pub const LEASE_MS: u64 = 3_000;
 pub(crate) const REPLICATE_MS: u64 = 5_000;
 pub const ISR_MS: u64 = 2 * LEASE_MS;
-const REPLACE_MS: u64 = 30_000;
+pub const REPLACE_MS: u64 = 30_000;
 const STOPS: u8 = SIGTERM | LIFECYCLE;
 const SEG_ASKS_MAX: usize = 64;
 const FRESH_MS: u64 = 2 * GOSSIP_MS;
@@ -130,6 +131,7 @@ mod raft_bytes {
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub enum Msg {
     Gossip(Vec<Update>),
+    Digest(Vec<Line>, bool),
     Ping(Head),
     Pong(u64, Head),
     Raft(#[serde(with = "raft_bytes")] Message),
@@ -155,6 +157,32 @@ pub enum Msg {
     MarksIs(Marks, Marks, BTreeSet<(u64, u64)>),
     RecordsAsk(Marks, Option<(u64, u64)>),
     Records(Vec<((u64, u64), u64, u64)>, Marks, bool),
+    Block {
+        id: u64,
+        segment: (u64, u32),
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    BlockOk {
+        id: u64,
+        offset: u64,
+    },
+    BlockErr {
+        id: u64,
+        offset: u64,
+    },
+    Ctl {
+        id: u64,
+        offset: u64,
+        bytes: Vec<u8>,
+    },
+    Handed {
+        id: u64,
+        mark: u64,
+        writer: Option<u64>,
+        unnamed: Option<(u64, Option<u64>)>,
+        named: Vec<((u64, u64), u64)>,
+    },
 }
 
 impl Msg {
@@ -194,6 +222,9 @@ pub enum Cmd {
         id: u64,
     },
     Guard,
+    Gap {
+        id: u64,
+    },
     Adopt {
         id: u64,
         mark: u64,
@@ -252,6 +283,9 @@ pub enum Cmd {
     },
     Tick,
     Ping,
+    Gossip {
+        to: Vec<u64>,
+    },
     SegAsks,
     Fresh,
     Beats,
@@ -401,7 +435,7 @@ pub struct Pass<'a> {
     want: Want,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Store {
     pub records: BTreeMap<(u64, u64), (u64, u64, u64)>,
     pub marks: Marks,
@@ -604,6 +638,7 @@ pub struct Node {
     pub(crate) now: u64,
     pub(crate) run: u64,
     pub(crate) isr_asks: Vec<(u64, u64, u64, BTreeSet<u64>)>,
+    copied_s: u64,
     pub(crate) store: Store,
     pub(crate) store_dirty: bool,
     pub(crate) requests: BTreeMap<u64, Request>,
@@ -734,6 +769,7 @@ impl Node {
             now,
             run,
             isr_asks: Vec::new(),
+            copied_s: 0,
             store,
             store_dirty: false,
             requests: BTreeMap::new(),
@@ -796,7 +832,7 @@ impl Node {
                 Cmd::AcceptLoss { disk } => {
                     let ok = if self.view.entry(disk).is_none() {
                         !self.raft.meta().members.contains(&disk)
-                    } else if self.view.absent(disk) {
+                    } else if self.absent_long(disk) {
                         self.lose.insert(disk);
                         true
                     } else {
@@ -822,6 +858,7 @@ impl Node {
                 }
                 Cmd::AnswerRequest { id } => self.answer_request(id, &mut out),
                 Cmd::Guard => self.guard(&mut out),
+                Cmd::Gap { id } => self.mark(id, None, &mut out),
                 Cmd::Place { id } => self.place(id, &mut out),
                 Cmd::Seal { reached } => self.seal(reached, &mut out),
                 Cmd::Adopt {
@@ -878,6 +915,13 @@ impl Node {
                     let head = self.view.own().head;
                     out.frames
                         .extend(self.links().into_iter().map(|b| (b, Msg::Ping(head))));
+                }
+                Cmd::Gossip { to } => {
+                    let digest = self.view.digest();
+                    out.frames.extend(
+                        to.into_iter()
+                            .map(|p| (p, Msg::Digest(digest.clone(), true))),
+                    );
                 }
                 Cmd::SegAsks => self.seg_asks(&mut out),
                 Cmd::Fresh => self.fresh(&mut out),
@@ -1392,6 +1436,13 @@ impl Node {
         let (now, run, from) = (self.now, self.run, f.from);
         match f.msg {
             Msg::Gossip(updates) => self.view.merge(&updates, now, run),
+            Msg::Digest(ask, reply) => {
+                out.frames.push((from, Msg::Gossip(self.view.answer(&ask))));
+                if reply {
+                    out.frames
+                        .push((from, Msg::Digest(self.view.digest(), false)));
+                }
+            }
             Msg::Ping(head) => {
                 self.beat(from, head);
                 out.frames
@@ -1405,7 +1456,7 @@ impl Node {
             Msg::Raft(message) => {
                 match self.raft.step(message) {
                     Ok(()) | Err(raft::Error::StepPeerNotFound | raft::Error::ProposalDropped) => {}
-                    Err(e) => panic!("the control plane refused a step: {e}"),
+                    Err(_) => out.effects.push(Effect::RaftRefused),
                 }
                 if self.raft.leader() == Some(from) {
                     self.heard_ms = Some(now);
@@ -1413,7 +1464,7 @@ impl Node {
                 self.flush(out);
             }
             Msg::Lose(disk) => {
-                if self.view.absent(disk) && self.raft.meta().members.contains(&disk) {
+                if self.absent_long(disk) && self.raft.meta().members.contains(&disk) {
                     self.lose.insert(disk);
                 }
             }
@@ -1587,6 +1638,11 @@ impl Node {
                     self.store_dirty = true;
                 }
             }
+            Msg::Block { .. }
+            | Msg::BlockOk { .. }
+            | Msg::BlockErr { .. }
+            | Msg::Ctl { .. }
+            | Msg::Handed { .. } => {}
         }
     }
 
@@ -1714,7 +1770,7 @@ impl Node {
             .is_some_and(|e| e.body_key.0 == e.head.restart && e.body.marks.contains(&id))
     }
 
-    fn holders_of(&self, id: u64) -> Vec<u64> {
+    pub fn holders_of(&self, id: u64) -> Vec<u64> {
         self.view
             .live()
             .map(|(d, _)| d)
@@ -1859,7 +1915,16 @@ impl Node {
 
     pub fn stop_done(&self, run: u64, knobs: &Knobs) -> bool {
         self.stop_run_ms.is_some_and(|t| run >= t)
-            || (self.drains(run, knobs).is_empty() && !self.raft.meta().members.contains(&self.me))
+            || (self.drains(run, knobs).is_empty()
+                && (!self.raft.meta().members.contains(&self.me) || self.every_member_stops()))
+    }
+
+    fn every_member_stops(&self) -> bool {
+        self.raft.meta().members.iter().all(|d| {
+            self.view
+                .entry(*d)
+                .is_some_and(|e| e.body_key.0 == e.head.restart && e.body.signals & STOPS != 0)
+        })
     }
 
     fn ring_of(&self) -> (Vec<u64>, BTreeMap<u64, u64>) {
@@ -1890,6 +1955,13 @@ impl Node {
             })
             .collect();
         (placement::ring(&candidates, self.ctl.floor.value), domain)
+    }
+
+    pub fn heavy_node(&self) -> Option<u64> {
+        self.heavy
+            .iter()
+            .find(|(_, (hold, _))| hold.heavy)
+            .map(|(id, _)| *id)
     }
 
     pub fn next_groups(&self) -> Option<Groups> {
@@ -2752,7 +2824,8 @@ impl Node {
                 set,
             });
         }
-        if now.is_multiple_of(GOSSIP_MS) {
+        if now / GOSSIP_MS != self.copied_s {
+            self.copied_s = now / GOSSIP_MS;
             out.frames.extend(
                 sends
                     .into_iter()
@@ -2841,8 +2914,26 @@ impl Node {
         }
     }
 
+    fn absent_long(&self, disk: u64) -> bool {
+        self.view.absent(disk)
+            && self
+                .view
+                .absent_since(disk)
+                .is_some_and(|t| self.run >= t + REPLACE_MS)
+    }
+
     fn govern(&mut self, out: &mut Output) {
+        for _ in 0..GOVERN_CHANGES {
+            if !self.govern_once(out) {
+                break;
+            }
+        }
+    }
+
+    fn govern_once(&mut self, out: &mut Output) -> bool {
         let (me, now, run) = (self.me, self.now, self.run);
+        let view = &self.view;
+        self.lose.retain(|d| view.absent(*d));
         if self.raft.is_leader() {
             let members = &self.raft.meta().members;
             let removed: Vec<u64> = self
@@ -2862,7 +2953,7 @@ impl Node {
                 out.frames
                     .extend(self.lose.iter().map(|d| (leader, Msg::Lose(*d))));
             }
-            return;
+            return false;
         }
         let (view, meta) = (&self.view, self.raft.meta());
         let flags = |d: u64| {
@@ -2903,8 +2994,10 @@ impl Node {
                         .any(|h| *h != m && meta.members.contains(h) && self.marked(now, *h, *id))
             })
         };
+        let all_stop = self.every_member_stops();
         let remove = meta.members.iter().copied().find(|m| {
             let (stop, drained, remaining) = flags(*m);
+            let stop = stop && !all_stop;
             if view.absent(*m) {
                 view.entry(*m).is_some()
                     && (stop && !needed(*m)
@@ -2936,10 +3029,14 @@ impl Node {
             .filter(|_| !self.raft.pending_conf());
         if let Some((kind, member)) = change {
             self.change(kind, member, out);
+            if !self.raft.pending_conf() {
+                return true;
+            }
         }
         for command in drops {
             self.propose_segment(command, out);
         }
+        false
     }
 }
 
@@ -3050,5 +3147,82 @@ mod tests {
         let (a, b) = (replay(&mut node()), replay(&mut node()));
         assert!(a.len() > 100);
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn a_local_raft_message_from_a_peer_is_dropped_not_a_panic() {
+        let mut n = node();
+        let mut hup = Message::default();
+        hup.set_msg_type(MessageType::MsgHup);
+        let input = Input {
+            now: 0,
+            run: 0,
+            cmds: Vec::new(),
+            frames: vec![Inbound {
+                from: 2,
+                sent: 0,
+                version: 0,
+                msg: Msg::Raft(hup),
+            }],
+            partial: false,
+            pairs: BTreeSet::new(),
+        };
+        let out = n.step(input, &mut |_, _, _| true);
+        assert!(out.effects.iter().any(|e| matches!(e, Effect::RaftRefused)));
+    }
+
+    #[test]
+    fn a_gap_clears_the_mark_of_a_segment_until_it_is_adopted_again() {
+        let mut n = node();
+        let adopt = Cmd::Adopt {
+            id: 5,
+            mark: 0,
+            born: 0,
+            writer: Some(2),
+            unnamed: None,
+            named: Vec::new(),
+        };
+        n.step(Input::cmd(0, 0, adopt.clone()), &mut |_, _, _| true);
+        assert!(n.marks.contains_key(&5));
+        n.step(Input::cmd(0, 0, Cmd::Gap { id: 5 }), &mut |_, _, _| true);
+        assert!(!n.marks.contains_key(&5));
+        n.step(Input::cmd(0, 0, adopt), &mut |_, _, _| true);
+        assert!(n.marks.contains_key(&5));
+    }
+
+    #[test]
+    fn accept_loss_needs_a_long_absence_and_a_returning_node_clears_it() {
+        let mut n = node();
+        let head = |restart, state| Head {
+            restart,
+            heartbeat: 0,
+            state,
+        };
+        let update = |restart, state| Update {
+            disk: 2,
+            head: head(restart, state),
+            body: Some(((restart, 0), Body::default())),
+        };
+        n.view.merge(&[update(1, State::Dead)], 0, 0);
+        let accept = |n: &mut Node, run: u64| {
+            let out = n.step(
+                Input::cmd(run, run, Cmd::AcceptLoss { disk: 2 }),
+                &mut |_, _, _| true,
+            );
+            out.effects
+                .iter()
+                .any(|e| matches!(e, Effect::Accepted(true)))
+        };
+        assert!(!accept(&mut n, REPLACE_MS - 1));
+        assert!(n.lose.is_empty());
+        assert!(accept(&mut n, REPLACE_MS));
+        assert!(n.lose.contains(&2));
+        n.view
+            .merge(&[update(2, State::Alive)], REPLACE_MS, REPLACE_MS);
+        n.step(
+            Input::cmd(REPLACE_MS, REPLACE_MS, Cmd::Govern),
+            &mut |_, _, _| true,
+        );
+        assert!(n.lose.is_empty());
     }
 }

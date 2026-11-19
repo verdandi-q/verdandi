@@ -18,6 +18,7 @@ use verdandi_store::engine::{Delivery, Handle};
 
 use crate::error::{Fail, NAMES};
 use crate::groups::bound;
+use crate::route::{PARTIAL, Route};
 use crate::take::{Options, REPLY_MAX, View, gather, limit};
 
 type Item = (String, Box<RawValue>);
@@ -45,6 +46,7 @@ pub(crate) async fn read(
     headers: &HeaderMap,
     stream: String,
     options: Options,
+    route: Option<&Route>,
 ) -> Result<Response, Fail> {
     if options.lease.is_some() || options.wait.is_some() || options.max_bytes.is_some() {
         return Err(Fail::bad(
@@ -98,13 +100,26 @@ pub(crate) async fn read(
         Bound::Unbounded => None,
     };
     if !follow {
-        let (items, resume) = fetch(handle, &stream, from, limit).await?;
+        let (mut items, mut resume) = fetch(handle, &stream, from, limit).await?;
+        let mut missing = 0;
+        if let Some(route) = route.filter(|route| !route.hop) {
+            let path = match after {
+                Some(id) => format!("/s/{stream}?from={id}&limit={limit}"),
+                None => format!("/s/{stream}?limit={limit}"),
+            };
+            (items, missing) = route.merge(items, &path, limit).await;
+            resume = items.last().and_then(|(id, _)| id.parse().ok()).or(resume);
+        }
         let next = match resume.or(after) {
             Some(from) => format!("/s/{stream}?from={from}&limit={limit}"),
             None => format!("/s/{stream}?limit={limit}"),
         };
         let messages = items.into_iter().map(|(_, raw)| raw).collect();
-        return Ok(Json(Page { messages, next }).into_response());
+        let mut reply = Json(Page { messages, next }).into_response();
+        if missing > 0 {
+            reply.headers_mut().insert(PARTIAL, missing.into());
+        }
+        return Ok(reply);
     }
     let events = headers
         .get(header::ACCEPT)

@@ -85,13 +85,13 @@ async fn provisional_group_counts_pending_in_flight_and_oldest_age_until_the_fir
     assert_eq!(leased.status, StatusCode::OK, "{}", leased.body);
     assert_eq!(
         leased.body,
-        json!({"pending": 1, "in_flight": 2, "dead": 0, "oldest_age_s": 5.0, "provisional": true})
+        json!({"pending": 1, "in_flight": 2, "dead": 0, "oldest_age_s": 5.0, "drain_rate": 0.0, "desired_consumers": 1, "provisional": true})
     );
     let acked = settle(&node, &receipt(&first), json!({"ack": [published[0]]})).await;
     assert_eq!(acked.status, StatusCode::OK);
     assert_eq!(
         stats(&node, "g").await.body,
-        json!({"pending": 1, "in_flight": 1, "dead": 0, "oldest_age_s": 5.0, "provisional": false})
+        json!({"pending": 1, "in_flight": 1, "dead": 0, "oldest_age_s": 5.0, "drain_rate": 1.0 / 60.0, "desired_consumers": 1, "provisional": false})
     );
     node.stop().await;
 }
@@ -246,7 +246,7 @@ async fn replay_two_at_once_settle_on_one_winner() {
     );
     assert_eq!(
         stats(&node, "g").await.body,
-        json!({"pending": 0, "in_flight": 0, "dead": 0, "oldest_age_s": 0.0, "provisional": false})
+        json!({"pending": 0, "in_flight": 0, "dead": 0, "oldest_age_s": 0.0, "drain_rate": 2.0 / 60.0, "desired_consumers": 0, "provisional": false})
     );
     node.stop().await;
 }
@@ -306,7 +306,7 @@ async fn redrive_delivers_dead_copies_again_and_a_second_death_lands_in_the_same
     assert_eq!(buried.status, StatusCode::OK, "{}", buried.body);
     assert_eq!(
         stats(&node, "g").await.body,
-        json!({"pending": 0, "in_flight": 0, "dead": 1, "oldest_age_s": 0.0, "provisional": false})
+        json!({"pending": 0, "in_flight": 0, "dead": 1, "oldest_age_s": 0.0, "drain_rate": 1.0 / 60.0, "desired_consumers": 0, "provisional": false})
     );
     let copies = dead_copies(&node, "s.dead.g", "probe1").await;
     assert_eq!(copies.len(), 1);
@@ -539,7 +539,7 @@ async fn group_stats_age_follows_the_oldest_unacked_message_and_a_stream_delete_
     assert_eq!(deleted.status, StatusCode::OK, "{}", deleted.body);
     assert_eq!(
         stats(&node, "g").await.body,
-        json!({"pending": 0, "in_flight": 0, "dead": 0, "oldest_age_s": 0.0, "provisional": false})
+        json!({"pending": 0, "in_flight": 0, "dead": 0, "oldest_age_s": 0.0, "drain_rate": 1.0 / 60.0, "desired_consumers": 0, "provisional": false})
     );
     node.stop().await;
 }

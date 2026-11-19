@@ -1,0 +1,219 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: Verdandi cluster on ECS Fargate
+Parameters:
+  ImageUri:
+    Type: String
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  Subnet1:
+    Type: AWS::EC2::Subnet::Id
+  Subnet2:
+    Type: AWS::EC2::Subnet::Id
+  Subnet3:
+    Type: AWS::EC2::Subnet::Id
+  ClientCidr:
+    Type: String
+    Description: Address range of the clients. They reach the load balancer on port 80.
+  ClusterKeySecretArn:
+    Type: String
+    Description: Secrets Manager secret that holds the cluster key. Run verdandi keygen to make one.
+  BackupUrl:
+    Type: String
+    Default: ""
+    Description: S3 URL for the backup. Set it on Fargate. A task replacement deletes the disk.
+  TaskRoleArn:
+    Type: String
+    Default: ""
+    Description: Role with access to the backup bucket. Needed when BackupUrl is set.
+  DesiredCount:
+    Type: Number
+    Default: 3
+    MinValue: 1
+  MinimumHealthyPercent:
+    Type: Number
+    Default: 66
+    Description: Size it to one task less than DesiredCount. For 3 tasks use 66. For 5 use 80.
+  CpuUnits:
+    Type: String
+    Default: "1024"
+  MemoryMiB:
+    Type: String
+    Default: "4096"
+  ReadyGraceSeconds:
+    Type: Number
+    Default: 900
+Conditions:
+  HasBackup: !Not [!Equals [!Ref BackupUrl, ""]]
+  HasTaskRole: !Not [!Equals [!Ref TaskRoleArn, ""]]
+Resources:
+  Cluster:
+    Type: AWS::ECS::Cluster
+  Logs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      RetentionInDays: 30
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ecs-tasks.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: read-cluster-key
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref ClusterKeySecretArn
+  LoadBalancerGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Verdandi load balancer
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref ClientCidr
+  TaskGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Verdandi tasks
+      VpcId: !Ref VpcId
+  FromLoadBalancer:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TaskGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref LoadBalancerGroup
+  PeerHttp:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TaskGroup
+      IpProtocol: tcp
+      FromPort: 8080
+      ToPort: 8080
+      SourceSecurityGroupId: !Ref TaskGroup
+  PeerLink:
+    Type: AWS::EC2::SecurityGroupIngress
+    Properties:
+      GroupId: !Ref TaskGroup
+      IpProtocol: tcp
+      FromPort: 7946
+      ToPort: 7946
+      SourceSecurityGroupId: !Ref TaskGroup
+  LoadBalancer:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Scheme: internal
+      Type: application
+      SecurityGroups:
+        - !Ref LoadBalancerGroup
+      Subnets:
+        - !Ref Subnet1
+        - !Ref Subnet2
+        - !Ref Subnet3
+  TargetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      VpcId: !Ref VpcId
+      Protocol: HTTP
+      Port: 8080
+      TargetType: ip
+      HealthCheckPath: /readyz
+      HealthCheckIntervalSeconds: 10
+      HealthyThresholdCount: 2
+      UnhealthyThresholdCount: 3
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "120"
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref LoadBalancer
+      Protocol: HTTP
+      Port: 80
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref TargetGroup
+  TaskDefinition:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: verdandi
+      RequiresCompatibilities:
+        - FARGATE
+      NetworkMode: awsvpc
+      Cpu: !Ref CpuUnits
+      Memory: !Ref MemoryMiB
+      ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+      TaskRoleArn: !If [HasTaskRole, !Ref TaskRoleArn, !Ref "AWS::NoValue"]
+      ContainerDefinitions:
+        - Name: verdandi
+          Image: !Ref ImageUri
+          Essential: true
+          StopTimeout: 120
+          PortMappings:
+            - ContainerPort: 8080
+            - ContainerPort: 7946
+          Environment:
+            - Name: VERDANDI_CLUSTER_URL
+              Value: !Sub "http://${LoadBalancer.DNSName}"
+            - !If
+              - HasBackup
+              - Name: VERDANDI_BACKUP_URL
+                Value: !Ref BackupUrl
+              - !Ref "AWS::NoValue"
+          Secrets:
+            - Name: VERDANDI_CLUSTER_KEY
+              ValueFrom: !Ref ClusterKeySecretArn
+          HealthCheck:
+            Command:
+              - CMD-SHELL
+              - curl -fs http://localhost:8080/livez || exit 1
+            Interval: 10
+            Timeout: 5
+            Retries: 3
+            StartPeriod: 60
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: !Ref Logs
+              awslogs-region: !Ref "AWS::Region"
+              awslogs-stream-prefix: verdandi
+  Service:
+    Type: AWS::ECS::Service
+    DependsOn: Listener
+    Properties:
+      Cluster: !Ref Cluster
+      LaunchType: FARGATE
+      TaskDefinition: !Ref TaskDefinition
+      DesiredCount: !Ref DesiredCount
+      HealthCheckGracePeriodSeconds: !Ref ReadyGraceSeconds
+      DeploymentConfiguration:
+        MaximumPercent: 100
+        MinimumHealthyPercent: !Ref MinimumHealthyPercent
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: DISABLED
+          SecurityGroups:
+            - !Ref TaskGroup
+          Subnets:
+            - !Ref Subnet1
+            - !Ref Subnet2
+            - !Ref Subnet3
+      LoadBalancers:
+        - ContainerName: verdandi
+          ContainerPort: 8080
+          TargetGroupArn: !Ref TargetGroup
+Outputs:
+  Url:
+    Value: !Sub "http://${LoadBalancer.DNSName}"

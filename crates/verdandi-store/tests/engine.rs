@@ -19,7 +19,9 @@ use verdandi_core::lease::{Bury, Nack, Receipt, Settle, SettleError};
 use verdandi_core::retention::RETAIN_MS;
 use verdandi_core::{Generation, PROVISIONAL_MS, Reason, Record, Timing, WaiterId, nth_id};
 use verdandi_sim::fault_fs::{Crash, FaultFile, FaultFs};
-use verdandi_store::block::{BLOCK_HEADER_LEN, FILE_HEADER_LEN, MAX_BLOCK, PAGE, SEGMENT_BYTES};
+use verdandi_store::block::{
+    BLOCK_HEADER_LEN, FILE_HEADER_LEN, MAX_BLOCK, PAGE, SEGMENT_BYTES, decode_bytes, encode_block,
+};
 use verdandi_store::engine::{
     BULK, DEAD_PER_PASS, Delivery, Engine, Error, Handle, IDLE_SEAL_MS, Key, NewMessage, OsRandom,
     PRESSURE_HOLD_MS, Random, SettleBy, Take, Taken, TestClock,
@@ -187,7 +189,7 @@ fn a_message_is_seen_only_after_its_block_syncs() {
         assert!(early.is_empty(), "a take saw a message before its fsync");
         fs.release_syncs();
         publish.await.expect("join").expect("publish");
-        let (_, late) = leased(node.handle.take(take("h", "s", 10)).await);
+        let (_, late) = leased(node.handle.take(take("g", "s", 10)).await);
         assert_eq!(late.len(), 1);
     });
     stop(&rt, node).expect("clean stop");
@@ -666,7 +668,7 @@ fn a_flip_at_rest_is_found_by_the_run_crc_never_served_and_recorded() {
     file.write_all_at(&[byte[0] ^ 0x40], at).expect("flip");
     let served = rt.block_on(node.handle.read(&handed)).expect("read");
     assert_eq!(served, [None, None]);
-    let (_, again) = leased(rt.block_on(node.handle.take(take("h", "s", 10))));
+    let (_, again) = leased(rt.block_on(node.handle.take(take("g", "s", 10))));
     assert!(again.is_empty(), "a damaged run was handed out again");
     let (_, other) = leased(rt.block_on(node.handle.take(take("h", "t", 10))));
     assert_eq!(ids(&other), kept);
@@ -2567,4 +2569,222 @@ fn a_close_during_a_dead_settle_in_steps_replies_stopped_and_writes_no_more_copi
     assert_eq!(rt.block_on(settle), Err(Error::Stopped));
     stop(&rt, node).expect("clean stop");
     assert!(copies_in(&fs, "s.dead.g").len() < published.len());
+}
+
+fn scanned(rt: &Runtime, node: &Node) -> Vec<(MessageId, Address)> {
+    rt.block_on(node.handle.scan("s".to_owned(), Bound::Unbounded, 100))
+        .expect("scan")
+        .iter()
+        .map(|d| (d.handed.id, d.handed.address))
+        .collect()
+}
+
+#[test]
+fn a_replica_block_gives_the_same_messages_and_addresses_and_survives_a_restart() {
+    let rt = runtime();
+    let clock = TestClock::new(1_000);
+    let (fs_a, fs_b, fs_c) = (
+        FaultFs::new(80, 1 << 40),
+        FaultFs::new(81, 1 << 40),
+        FaultFs::new(82, 1 << 40),
+    );
+    let a = boot(&rt, &fs_a, Path::new(DATA), &clock);
+    let mut hook = rt.block_on(a.handle.subscribe()).expect("subscribe");
+    let values: [&[u8]; 3] = [b"one", b"two", b"three"];
+    for value in values {
+        publish(&rt, &a, "s", &[value]);
+    }
+    let mut committed = Vec::new();
+    while let Ok(block) = hook.try_recv() {
+        committed.push(block);
+    }
+    assert_eq!(committed.len(), 3);
+    let expected = scanned(&rt, &a);
+    assert_eq!(expected.len(), 3);
+    let segment = expected[0].1.segment;
+
+    let b = boot(&rt, &fs_b, Path::new(DATA), &clock);
+    for (id, offset, bytes) in &committed {
+        assert_eq!(*id, segment);
+        rt.block_on(b.handle.replicate(*id, *offset, bytes.clone()))
+            .expect("replicate");
+    }
+    assert_eq!(scanned(&rt, &b), expected);
+    let found = rt
+        .block_on(b.handle.scan("s".to_owned(), Bound::Unbounded, 100))
+        .expect("scan");
+    for (delivery, value) in found.iter().zip(values) {
+        let message = read_one(&rt, &b, delivery).expect("message");
+        assert_eq!(message.value, value);
+    }
+
+    let (_, offset, bytes) = committed[0].clone();
+    assert_eq!(
+        rt.block_on(b.handle.replicate(segment, offset, bytes.clone())),
+        Ok(())
+    );
+    let (_, second_offset, second) = committed[1].clone();
+    let (header, _) = decode_bytes(&bytes, offset).expect("block");
+    let (_, other) = decode_bytes(&second, second_offset).expect("block");
+    let different = encode_block(&header, other);
+    assert!(
+        rt.block_on(b.handle.replicate(segment, offset, different))
+            .is_err()
+    );
+    let mut damaged = second.clone();
+    let last = damaged.len() - 1;
+    damaged[last] ^= 0xff;
+    let c = boot(&rt, &fs_c, Path::new(DATA), &clock);
+    assert!(
+        rt.block_on(c.handle.replicate(segment, second_offset, second.clone()))
+            .is_err()
+    );
+    let (_, first_offset, first) = committed[0].clone();
+    assert!(
+        rt.block_on(c.handle.replicate(segment, first_offset, damaged))
+            .is_err()
+    );
+    let other_segment = SegmentId {
+        incarnation: segment.incarnation,
+        seq: segment.seq + 1,
+    };
+    assert!(
+        rt.block_on(c.handle.replicate(other_segment, first_offset, first))
+            .is_err()
+    );
+    assert_eq!(scanned(&rt, &c), Vec::new());
+    stop(&rt, c).expect("stop c");
+
+    stop(&rt, b).expect("stop b");
+    let b = boot(&rt, &fs_b, Path::new(DATA), &clock);
+    assert_eq!(scanned(&rt, &b), expected);
+    publish(&rt, &b, "s", &[b"local"]);
+    let all = scanned(&rt, &b);
+    assert_eq!(all.len(), 4);
+    assert_ne!(all[3].1.segment, segment);
+    stop(&rt, b).expect("stop b");
+    stop(&rt, a).expect("stop a");
+}
+
+#[test]
+fn a_replica_segment_is_taken_only_while_led_and_a_lost_lease_comes_back() {
+    let rt = runtime();
+    let clock = TestClock::new(1_000);
+    let (fs_a, fs_b) = (FaultFs::new(83, 1 << 40), FaultFs::new(84, 1 << 40));
+    let a = boot(&rt, &fs_a, Path::new(DATA), &clock);
+    let mut hook = rt.block_on(a.handle.subscribe()).expect("subscribe");
+    publish(&rt, &a, "s", &[b"remote"]);
+    let segment = scanned(&rt, &a)[0].1.segment;
+    let (engine, handle) = rt
+        .block_on(Engine::open_as(
+            fs_b.clone(),
+            Path::new(DATA),
+            Arc::new(clock.clone()),
+            Box::new(OsRandom),
+            7,
+        ))
+        .expect("open");
+    let task = rt.spawn(engine.run());
+    let b = Node { handle, task };
+    while let Ok((id, offset, bytes)) = hook.try_recv() {
+        rt.block_on(b.handle.replicate(id, offset, bytes))
+            .expect("replicate");
+    }
+    rt.block_on(b.handle.lead(BTreeSet::new(), u64::MAX))
+        .expect("lead");
+    let (_, none) = leased(rt.block_on(b.handle.take(take("g", "s", 10))));
+    assert!(none.is_empty(), "a replica message was taken");
+    assert_eq!(scanned(&rt, &b).len(), 1);
+    let own = publish(&rt, &b, "s", &[b"local"]);
+    let own_segment = scanned(&rt, &b)[1].1.segment;
+    let (_, none) = leased(rt.block_on(b.handle.take(take("g", "s", 10))));
+    assert!(none.is_empty(), "an own message was taken while not led");
+    rt.block_on(b.handle.lead(BTreeSet::from([own_segment]), u64::MAX))
+        .expect("lead");
+    let (receipt, got) = leased(rt.block_on(b.handle.take(take("g", "s", 10))));
+    assert_eq!(ids(&got), own);
+    assert_eq!(receipt.issuer(), 7);
+
+    rt.block_on(b.handle.lead(BTreeSet::from([segment]), u64::MAX))
+        .expect("lead");
+    let (first, got) = leased(rt.block_on(b.handle.take(take("g", "s", 10))));
+    assert_eq!(got.len(), 1);
+    rt.block_on(b.handle.lead(BTreeSet::new(), u64::MAX))
+        .expect("unlead");
+    let (_, none) = leased(rt.block_on(b.handle.take(take("g", "s", 10))));
+    assert!(none.is_empty());
+    assert_eq!(
+        rt.block_on(b.handle.settle(first, SettleBy::All)),
+        Err(Error::Refused(SettleError::UnknownReceipt))
+    );
+    rt.block_on(b.handle.lead(BTreeSet::from([segment]), u64::MAX))
+        .expect("lead");
+    let (_, again) = leased(rt.block_on(b.handle.take(take("g", "s", 10))));
+    assert_eq!(again.len(), 1);
+    stop(&rt, b).expect("stop b");
+    stop(&rt, a).expect("stop a");
+}
+
+#[test]
+fn a_confirm_that_comes_before_the_landing_still_completes_the_publish() {
+    let rt = runtime();
+    let clock = TestClock::new(1_000);
+    let fs = FaultFs::new(91, 1 << 40);
+    let a = boot(&rt, &fs, Path::new(DATA), &clock);
+    let mut hook = rt.block_on(a.handle.subscribe_held()).expect("subscribe");
+    rt.block_on(async {
+        for _ in 0..40 {
+            let handle = a.handle.clone();
+            let publishing =
+                tokio::spawn(async move { handle.publish(vec![message("s", b"x")], None).await });
+            let (segment, offset, _) = hook.recv().await.expect("hook");
+            a.handle.confirm(segment, offset, 2).await.expect("confirm");
+            let done = tokio::time::timeout(Duration::from_secs(5), publishing)
+                .await
+                .expect("the publish hung")
+                .expect("join");
+            assert_eq!(done.expect("published").copies, 2);
+        }
+    });
+    stop(&rt, a).expect("stop a");
+}
+
+#[test]
+fn a_lead_gate_clears_when_the_deadline_passes_with_no_renew() {
+    let rt = runtime();
+    let clock = TestClock::new(1_000);
+    let fs = FaultFs::new(92, 1 << 40);
+    let a = boot(&rt, &fs, Path::new(DATA), &clock);
+    publish(&rt, &a, "s", &[b"x"]);
+    let segment = scanned(&rt, &a)[0].1.segment;
+    rt.block_on(a.handle.lead(BTreeSet::from([segment]), 5_000))
+        .expect("lead");
+    let (_, got) = leased(rt.block_on(a.handle.take(take("g", "s", 10))));
+    assert_eq!(got.len(), 1);
+    clock.advance(10_000);
+    let (_, none) = leased(rt.block_on(a.handle.take(take("h", "s", 10))));
+    assert!(none.is_empty(), "the gate stayed open after the deadline");
+    stop(&rt, a).expect("stop a");
+}
+
+#[test]
+fn a_replicate_offset_near_the_end_of_u64_is_refused() {
+    let rt = runtime();
+    let clock = TestClock::new(1_000);
+    let (fs_a, fs_b) = (FaultFs::new(93, 1 << 40), FaultFs::new(94, 1 << 40));
+    let a = boot(&rt, &fs_a, Path::new(DATA), &clock);
+    let mut hook = rt.block_on(a.handle.subscribe()).expect("subscribe");
+    publish(&rt, &a, "s", &[b"x"]);
+    let (segment, offset, bytes) = hook.try_recv().expect("block");
+    let b = boot(&rt, &fs_b, Path::new(DATA), &clock);
+    rt.block_on(b.handle.replicate(segment, offset, bytes.clone()))
+        .expect("replicate");
+    let (mut header, body) = decode_bytes(&bytes, offset).expect("decode");
+    header.offset = u64::MAX - 1;
+    let far = encode_block(&header, body);
+    let refused = rt.block_on(b.handle.replicate(segment, u64::MAX - 1, far));
+    assert!(matches!(refused, Err(Error::Unreadable(_))), "{refused:?}");
+    assert_eq!(publish(&rt, &b, "s", &[b"y"]).len(), 1);
+    stop(&rt, b).expect("stop b");
+    stop(&rt, a).expect("stop a");
 }

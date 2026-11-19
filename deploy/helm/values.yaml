@@ -1,0 +1,13 @@
+image:
+  repository: verdandi
+  tag: c5
+  pullPolicy: IfNotPresent
+replicas: 3
+clusterKey:
+  secretName: ""
+  secretKey: key
+backupUrl: ""
+persistence:
+  size: 100Gi
+  storageClass: ""
+resources: {}

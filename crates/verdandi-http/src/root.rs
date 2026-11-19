@@ -1,14 +1,16 @@
 use std::collections::BTreeMap;
 
 use axum::Json;
-use axum::extract::State;
+use axum::extract::{Extension, State};
 use axum::http::{HeaderMap, Uri, header};
 use axum::response::{IntoResponse, Response};
 use serde::Serialize;
+use std::sync::Arc;
 use utoipa::ToSchema;
 
 use crate::error::{ErrorBody, Fail};
-use crate::{NEXT_STEP, Node, OPEN_MODE, host, ready};
+use crate::{Cluster, NEXT_STEP, Node, OPEN_MODE, host, pressure, ready, scale};
+use verdandi_core::cluster::steer::scale_hint;
 
 const GUIDE: &str = include_str!("guide.txt");
 const DAY_S: u64 = 24 * 3600;
@@ -20,6 +22,8 @@ pub(crate) struct Status {
     streams: Vec<String>,
     groups: Vec<GroupInfo>,
     warnings: Vec<String>,
+    #[schema(required = true)]
+    scale_hint: Option<String>,
     links: BTreeMap<&'static str, &'static str>,
 }
 
@@ -38,6 +42,7 @@ struct Disk {
 struct Copies {
     ack_count: u32,
     target: u32,
+    floor: u32,
     why: &'static str,
 }
 
@@ -86,6 +91,7 @@ pub async fn root(
     State(node): State<Node>,
     headers: HeaderMap,
     uri: Uri,
+    cluster: Option<Extension<Arc<Cluster>>>,
 ) -> Result<Response, Fail> {
     if wants_guide(&headers) {
         let text = GUIDE.replace("{host}", host(&headers, &uri).unwrap_or_default());
@@ -156,6 +162,9 @@ pub async fn root(
             d.free
         ));
     }
+    let (live, floor) = scale(cluster.as_deref().map(|c| &**c));
+    let (heavy, full) = pressure(cluster.as_deref().map(|c| &**c));
+    let until_full = [time_until_full_s, full].into_iter().flatten().min();
     let json = Json(Status {
         node: Disk {
             disk_total_bytes: status.disk.map(|d| d.total),
@@ -163,11 +172,7 @@ pub async fn root(
             write_bytes_per_s: status.write_bytes_per_s,
             time_until_full_s,
         },
-        copies: Copies {
-            ack_count: 1,
-            target: 1,
-            why: "one node",
-        },
+        copies: copies(cluster.as_deref().map(|c| &**c)),
         streams: status.streams,
         groups: status
             .groups
@@ -175,7 +180,28 @@ pub async fn root(
             .map(|(name, provisional)| GroupInfo { name, provisional })
             .collect(),
         warnings,
+        scale_hint: scale_hint(heavy, until_full, live, floor),
         links: BTreeMap::from(LINKS),
     });
     Ok(([(header::VARY, "Accept")], json).into_response())
+}
+
+fn copies(cluster: Option<&Cluster>) -> Copies {
+    match cluster.and_then(|c| c.copies.as_ref()) {
+        Some(f) => {
+            let (count, target, floor) = f();
+            Copies {
+                ack_count: count.into(),
+                target: target.into(),
+                floor: floor.into(),
+                why: "the durability controller",
+            }
+        }
+        None => Copies {
+            ack_count: 1,
+            target: 1,
+            floor: 1,
+            why: "one node",
+        },
+    }
 }

@@ -88,6 +88,11 @@ impl From<Error> for Fail {
                 text,
                 "take as the group to create it: GET /s/{stream}?group={group}",
             ),
+            Error::Unconfirmed => Self::new(
+                StatusCode::SERVICE_UNAVAILABLE,
+                text,
+                "retry the request: the cluster could not copy the data",
+            ),
             Error::Unreadable(_) => {
                 Self::new(StatusCode::SERVICE_UNAVAILABLE, text, "retry the request")
             }

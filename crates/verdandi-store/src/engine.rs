@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ring::rand::{SecureRandom, SystemRandom};
+use tokio::sync::mpsc::UnboundedReceiver;
 use tokio::sync::{mpsc, oneshot, watch};
 use tokio::time::MissedTickBehavior;
 use verdandi_core::group::{GroupStats, Handed, TakeOutcome, TakeRequest};
@@ -15,11 +16,16 @@ use verdandi_core::{
     Action, Core, DeadCopy, Generation, Reason, Record, Timing, WaiterId, names, nth_id, retention,
 };
 
-use crate::block::{BLOCK_HEADER_LEN, BlockHeader, FILE_HEADER_LEN, MAX_BLOCK, SEGMENT_BYTES};
+use crate::block::{
+    BLOCK_HEADER_LEN, BlockHeader, FILE_HEADER_LEN, FileHeader, FileKind, MAX_BLOCK, SEGMENT_BYTES,
+    align, decode_bytes, encode_block,
+};
 use crate::compaction::{Compactor, Job, Keep, Output, Report, Scanned};
 use crate::fs::{Fs, FsFile, FsStat};
 use crate::index::{self, Index, Location, ReadError, Run};
-use crate::log::{self, Log, SealPoint, Written, fits, seal_at, segment_file_name};
+use crate::log::{
+    self, Committed, Log, SealPoint, Written, fits, next_offset, seal_at, segment_file_name,
+};
 use crate::records::{self, Control, Damage, Message, Origin, RunEntry};
 use crate::recovery::{Warning, recover};
 use crate::retention::{FileInfo, Holding, RESCAN_MS, SWEEP_MS, carries, select};
@@ -29,13 +35,16 @@ pub const KEY_MS: u64 = 24 * 3600 * 1000;
 pub const CHANNEL: usize = 1024;
 pub const BULK: &str = "/bulk";
 pub const DEAD_PER_PASS: usize = 16;
+const COPY_CHUNK: usize = 4 << 20;
 pub const PRESSURE_HOLD_MS: u64 = 10_000;
 
 const TICK: Duration = Duration::from_millis(100);
 const PRUNE_MS: u64 = 60_000;
 const RATE_MS: u64 = 60_000;
+pub const DRAIN_S: u64 = 60;
 const BLOCK_CAP: usize = MAX_BLOCK - BLOCK_HEADER_LEN;
 const EMPTY_BODY: usize = 4;
+const EARLY_CAP: usize = 1024;
 const QUEUE_CAP: usize = 64 << 20;
 
 pub trait Clock: Send + Sync + 'static {
@@ -109,6 +118,8 @@ pub enum Error {
     Refused(SettleError),
     #[error("the system random source failed")]
     Random,
+    #[error("the block did not reach enough durable copies")]
+    Unconfirmed,
     #[error("a run of the log could not be read: {0}")]
     Unreadable(String),
     #[error("no group with this name exists")]
@@ -135,6 +146,7 @@ pub struct Key {
 pub struct Published {
     pub first: MessageId,
     pub count: u32,
+    pub copies: u32,
     pub repeat: bool,
 }
 
@@ -173,7 +185,7 @@ pub enum SettleBy {
 }
 
 type Reply<T> = oneshot::Sender<Result<T, Error>>;
-type Done = Box<dyn FnOnce(Result<(), Error>) + Send>;
+type Done = Box<dyn FnOnce(Result<(), Error>, u32) + Send>;
 type Cached = Option<(Address, Result<Vec<Message>, String>)>;
 
 enum Command {
@@ -197,6 +209,9 @@ enum Command {
         reply: Reply<()>,
     },
     Cancel(WaiterId),
+    Lead(BTreeSet<SegmentId>, u64),
+    Open(BTreeSet<SegmentId>),
+    Stored(BTreeSet<SegmentId>),
     Replay {
         group: String,
         from: Option<Bound<MessageId>>,
@@ -231,6 +246,31 @@ enum Command {
         reply: Reply<Vec<Delivery>>,
     },
     Issued(Reply<MessageId>),
+    Subscribe(Reply<UnboundedReceiver<Committed>>, bool),
+    Confirm {
+        segment: SegmentId,
+        offset: u64,
+        copies: u32,
+    },
+    Replicate {
+        segment: SegmentId,
+        offset: u64,
+        bytes: Vec<u8>,
+        reply: Reply<()>,
+    },
+    Controls {
+        offset: u64,
+        bytes: Vec<u8>,
+        reply: Reply<()>,
+    },
+    Blocks {
+        segment: SegmentId,
+        from: u64,
+        reply: Reply<Vec<(u64, Vec<u8>)>>,
+    },
+    Segments(Reply<Vec<SegmentId>>),
+    Sealed(Reply<Vec<SegmentId>>),
+    Snapshot(Reply<Vec<u8>>),
     Close,
 }
 
@@ -267,6 +307,62 @@ impl Handle {
         rx.await.unwrap_or(Err(Error::Stopped))
     }
 
+    pub async fn subscribe(&self) -> Result<UnboundedReceiver<Committed>, Error> {
+        self.call(|reply| Command::Subscribe(reply, false)).await
+    }
+
+    pub async fn subscribe_held(&self) -> Result<UnboundedReceiver<Committed>, Error> {
+        self.call(|reply| Command::Subscribe(reply, true)).await
+    }
+
+    pub async fn confirm(&self, segment: SegmentId, offset: u64, copies: u32) -> Result<(), Error> {
+        self.tx
+            .send(Command::Confirm {
+                segment,
+                offset,
+                copies,
+            })
+            .await
+            .map_err(|_| Error::Stopped)
+    }
+
+    pub async fn replicate(
+        &self,
+        segment: SegmentId,
+        offset: u64,
+        bytes: Vec<u8>,
+    ) -> Result<(), Error> {
+        self.call(|reply| Command::Replicate {
+            segment,
+            offset,
+            bytes,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn blocks(
+        &self,
+        segment: SegmentId,
+        from: u64,
+    ) -> Result<Vec<(u64, Vec<u8>)>, Error> {
+        self.call(|reply| Command::Blocks {
+            segment,
+            from,
+            reply,
+        })
+        .await
+    }
+
+    pub async fn controls(&self, offset: u64, bytes: Vec<u8>) -> Result<(), Error> {
+        self.call(|reply| Command::Controls {
+            offset,
+            bytes,
+            reply,
+        })
+        .await
+    }
+
     pub async fn publish(
         &self,
         messages: Vec<NewMessage>,
@@ -300,6 +396,39 @@ impl Handle {
             reply,
         })
         .await
+    }
+
+    pub async fn lead(&self, segments: BTreeSet<SegmentId>, until_ms: u64) -> Result<(), Error> {
+        self.tx
+            .send(Command::Lead(segments, until_ms))
+            .await
+            .map_err(|_| Error::Stopped)
+    }
+
+    pub async fn open_foreign(&self, segments: BTreeSet<SegmentId>) -> Result<(), Error> {
+        self.tx
+            .send(Command::Open(segments))
+            .await
+            .map_err(|_| Error::Stopped)
+    }
+
+    pub async fn stored(&self, segments: BTreeSet<SegmentId>) -> Result<(), Error> {
+        self.tx
+            .send(Command::Stored(segments))
+            .await
+            .map_err(|_| Error::Stopped)
+    }
+
+    pub async fn segments(&self) -> Result<Vec<SegmentId>, Error> {
+        self.call(Command::Segments).await
+    }
+
+    pub async fn sealed(&self) -> Result<Vec<SegmentId>, Error> {
+        self.call(Command::Sealed).await
+    }
+
+    pub async fn snapshot(&self) -> Result<Vec<u8>, Error> {
+        self.call(Command::Snapshot).await
     }
 
     pub async fn cancel(&self, waiter: WaiterId) -> Result<(), Error> {
@@ -470,6 +599,7 @@ struct Pending {
     controls: Vec<Control>,
     tickets: Vec<u64>,
     bytes: usize,
+    local: bool,
 }
 
 impl Pending {
@@ -479,6 +609,7 @@ impl Pending {
             controls: Vec::new(),
             tickets: Vec::new(),
             bytes: EMPTY_BODY,
+            local: false,
         }
     }
 }
@@ -492,6 +623,7 @@ struct Landing {
     end: u32,
     total: u64,
     commit_ms: u64,
+    local: bool,
 }
 
 enum Flight {
@@ -502,6 +634,7 @@ enum Flight {
 struct Ticket {
     remaining: usize,
     error: Option<Error>,
+    copies: u32,
     done: Done,
 }
 
@@ -510,6 +643,7 @@ pub struct Engine<F: Fs> {
     dir: PathBuf,
     clock: Arc<dyn Clock>,
     random: Box<dyn Random>,
+    node: u64,
     incarnation: u64,
     core: Core,
     log: Option<Log>,
@@ -520,6 +654,13 @@ pub struct Engine<F: Fs> {
     queue: VecDeque<Pending>,
     flight: Option<Flight>,
     tickets: BTreeMap<u64, Ticket>,
+    held: bool,
+    pushing_local: bool,
+    unconfirmed: BTreeMap<(SegmentId, u64), Vec<u64>>,
+    early: BTreeMap<(SegmentId, u64), u32>,
+    lead_until: Option<u64>,
+    open_foreign: BTreeSet<SegmentId>,
+    stored: Option<BTreeSet<SegmentId>>,
     next_ticket: u64,
     awaits: BTreeMap<(String, Address), Vec<u64>>,
     waiters: BTreeMap<WaiterId, (String, oneshot::Sender<()>)>,
@@ -535,6 +676,7 @@ pub struct Engine<F: Fs> {
     floor: bool,
     enospc: Option<u64>,
     dropped: Vec<DeadCopy>,
+    acked: BTreeMap<String, VecDeque<(u64, u64)>>,
     burying: VecDeque<(u64, MessageId, VecDeque<DeadCopy>)>,
     burying_bytes: usize,
     buried: Cached,
@@ -551,12 +693,18 @@ pub struct Engine<F: Fs> {
     last_rescan: u64,
     last_sweep: u64,
     active: Option<SegmentId>,
+    replicas: BTreeMap<SegmentId, Replica>,
     last_write: u64,
     last_tick: Option<u64>,
     last_prune: u64,
     written: u64,
     marks: [(u64, u64); 2],
     stopped: bool,
+}
+
+struct Replica {
+    file: Arc<dyn FsFile>,
+    end: u64,
 }
 
 #[derive(Default)]
@@ -725,6 +873,10 @@ fn random<const N: usize>(source: &mut dyn Random) -> Result<[u8; N], Error> {
     Ok(bytes)
 }
 
+fn refused(why: &str) -> Error {
+    Error::Unreadable(format!("replica refused: {why}"))
+}
+
 fn engine_error(error: &log::Error) -> Error {
     match error {
         log::Error::NoSpace => Error::NoSpace,
@@ -756,7 +908,17 @@ impl<F: Fs + Clone> Engine<F> {
         fs: F,
         dir: &Path,
         clock: Arc<dyn Clock>,
+        source: Box<dyn Random>,
+    ) -> Result<(Self, Handle), log::Error> {
+        Self::open_as(fs, dir, clock, source, 0).await
+    }
+
+    pub async fn open_as(
+        fs: F,
+        dir: &Path,
+        clock: Arc<dyn Clock>,
         mut source: Box<dyn Random>,
+        node: u64,
     ) -> Result<(Self, Handle), log::Error> {
         let incarnation = u64::from_le_bytes(
             random(source.as_mut()).map_err(|e| log::Error::Io(std::io::Error::other(e)))?,
@@ -833,6 +995,7 @@ impl<F: Fs + Clone> Engine<F> {
             dir: dir.to_path_buf(),
             clock: Arc::clone(&clock),
             random: source,
+            node,
             incarnation,
             core,
             log: Some(log),
@@ -843,6 +1006,13 @@ impl<F: Fs + Clone> Engine<F> {
             queue: VecDeque::new(),
             flight: None,
             tickets: BTreeMap::new(),
+            held: false,
+            pushing_local: false,
+            unconfirmed: BTreeMap::new(),
+            early: BTreeMap::new(),
+            lead_until: None,
+            open_foreign: BTreeSet::new(),
+            stored: None,
             next_ticket: 0,
             awaits: BTreeMap::new(),
             waiters: BTreeMap::new(),
@@ -858,6 +1028,7 @@ impl<F: Fs + Clone> Engine<F> {
             floor: false,
             enospc: None,
             dropped: Vec::new(),
+            acked: BTreeMap::new(),
             burying: VecDeque::new(),
             burying_bytes: 0,
             buried: None,
@@ -874,6 +1045,7 @@ impl<F: Fs + Clone> Engine<F> {
             last_rescan: clock.now_ms(),
             last_sweep: clock.now_ms(),
             active: None,
+            replicas: BTreeMap::new(),
             last_write: 0,
             last_tick: None,
             last_prune: 0,
@@ -1075,16 +1247,19 @@ impl<F: Fs + Clone> Engine<F> {
                 let records = self.core.redrive(&group);
                 self.write(records, reply);
             }
-            Command::Forget { group, reply } => match self.core.forget(&group) {
-                Some(record) => self.write(vec![record], reply),
-                None => {
-                    reply.send(Err(Error::NoGroup)).ok();
+            Command::Forget { group, reply } => {
+                self.acked.remove(&group);
+                match self.core.forget(&group) {
+                    Some(record) => self.write(vec![record], reply),
+                    None => {
+                        reply.send(Err(Error::NoGroup)).ok();
+                    }
                 }
-            },
+            }
             Command::DeleteStream { stream, reply } => {
                 let now = self.clock.now_ms();
                 let up_to = self.next_id(now);
-                let ticket = self.ticket(Box::new(move |result| {
+                let ticket = self.ticket(Box::new(move |result, _| {
                     reply.send(result.map(|()| up_to)).ok();
                 }));
                 let record = Record::Tombstone { stream, up_to };
@@ -1106,9 +1281,11 @@ impl<F: Fs + Clone> Engine<F> {
                 reply.send(Ok(self.status())).ok();
             }
             Command::Stats { group, reply } => {
-                reply
-                    .send(Ok(self.core.group_stats(&group, self.clock.now_ms())))
-                    .ok();
+                let mut stats = self.core.group_stats(&group, self.clock.now_ms());
+                if let Some(stats) = &mut stats {
+                    stats.settled_60s = self.acks_in_window(&group);
+                }
+                reply.send(Ok(stats)).ok();
             }
             Command::Compact(reply) => {
                 self.pass_due = true;
@@ -1147,12 +1324,331 @@ impl<F: Fs + Clone> Engine<F> {
                     MessageId::new(ms, incarnation, counter).expect("the clock is inside 48 bits");
                 reply.send(Ok(id)).ok();
             }
+            Command::Confirm {
+                segment,
+                offset,
+                copies,
+            } => {
+                let result = if copies > 0 {
+                    Ok(())
+                } else {
+                    Err(Error::Unconfirmed)
+                };
+                match self.unconfirmed.remove(&(segment, offset)) {
+                    Some(tickets) => {
+                        for ticket in tickets {
+                            self.count_copies(ticket, copies);
+                            self.release_ticket(ticket, result.clone());
+                        }
+                    }
+                    None => {
+                        if self.early.len() >= EARLY_CAP {
+                            self.early.pop_first();
+                        }
+                        self.early.insert((segment, offset), copies);
+                    }
+                }
+            }
+            Command::Subscribe(reply, held) => {
+                let (tx, rx) = mpsc::unbounded_channel();
+                match &self.log {
+                    Some(log) => {
+                        self.held = held;
+                        log.subscribe(tx);
+                        reply.send(Ok(rx)).ok();
+                    }
+                    None => {
+                        reply.send(Err(Error::Stopped)).ok();
+                    }
+                }
+            }
+            Command::Replicate {
+                segment,
+                offset,
+                bytes,
+                reply,
+            } => {
+                reply.send(self.replicate(segment, offset, bytes)).ok();
+            }
+            Command::Controls {
+                offset,
+                bytes,
+                reply,
+            } => {
+                self.local_controls(offset, &bytes, reply);
+            }
+            Command::Blocks {
+                segment,
+                from,
+                reply,
+            } => {
+                reply.send(self.blocks(segment, from)).ok();
+            }
+            Command::Lead(segments, until_ms) => {
+                self.lead_until = Some(until_ms);
+                let actions = self.core.set_led(segments);
+                self.act(actions, None);
+            }
+            Command::Open(segments) => self.open_foreign = segments,
+            Command::Stored(segments) => {
+                self.stored = Some(segments);
+                self.pass_due = true;
+            }
+            Command::Segments(reply) => {
+                reply.send(Ok(self.owner.keys().copied().collect())).ok();
+            }
+            Command::Sealed(reply) => {
+                let sealed = self
+                    .owner
+                    .iter()
+                    .filter(|(id, path)| {
+                        **path == self.dir.join(segment_file_name(**id))
+                            && self.files.get(*path).is_some_and(|info| info.sealed)
+                    })
+                    .map(|(id, _)| *id)
+                    .collect();
+                reply.send(Ok(sealed)).ok();
+            }
+            Command::Snapshot(reply) => {
+                let controls: Vec<Control> = self
+                    .core
+                    .snapshot()
+                    .into_iter()
+                    .map(Control::Record)
+                    .collect();
+                let (body, _) = records::encode(&[], &controls);
+                let header = BlockHeader {
+                    segment: SegmentId {
+                        incarnation: self.incarnation,
+                        seq: 0,
+                    },
+                    offset: 0,
+                    epoch: 0,
+                    compaction_version: 0,
+                    commit_ms: self.clock.now_ms(),
+                };
+                reply.send(Ok(encode_block(&header, &body))).ok();
+            }
             Command::Close => self.rx.close(),
         }
     }
 
+    fn blocks(&self, segment: SegmentId, from: u64) -> Result<Vec<(u64, Vec<u8>)>, Error> {
+        let path = self.dir.join(segment_file_name(segment));
+        if self.owner.get(&segment).is_some_and(|owner| *owner != path) {
+            return Err(refused("the segment is compacted here"));
+        }
+        let file = self
+            .fs
+            .open(&path)
+            .map_err(|e| Error::Unreadable(e.to_string()))?;
+        let size = file.size().map_err(|e| Error::Unreadable(e.to_string()))?;
+        let mut offset = next_offset(from);
+        let mut out = Vec::new();
+        let mut total = 0;
+        while total < COPY_CHUNK && offset + BLOCK_HEADER_LEN as u64 <= size {
+            let mut head = [0u8; BLOCK_HEADER_LEN];
+            if file.read_at(&mut head, offset).is_err() {
+                break;
+            }
+            let mut len = [0u8; 4];
+            len.copy_from_slice(&head[46..50]);
+            let len = BLOCK_HEADER_LEN + u32::from_le_bytes(len) as usize;
+            if len > BLOCK_HEADER_LEN + MAX_BLOCK || offset + len as u64 > size {
+                break;
+            }
+            let mut block = vec![0u8; len];
+            if file.read_at(&mut block, offset).is_err() || decode_bytes(&block, offset).is_err() {
+                break;
+            }
+            total += len;
+            let at = offset;
+            offset = align(offset + len as u64);
+            out.push((at, block));
+        }
+        Ok(out)
+    }
+
+    fn replicate(&mut self, segment: SegmentId, offset: u64, bytes: Vec<u8>) -> Result<(), Error> {
+        if self.stopped {
+            return Err(Error::Stopped);
+        }
+        let (header, body) =
+            decode_bytes(&bytes, offset).map_err(|_| refused("the block is damaged"))?;
+        if header.segment != segment || segment.incarnation == self.incarnation {
+            return Err(refused("the block is not for a foreign segment"));
+        }
+        let decoded = records::decode(body).map_err(|_| refused("the body is malformed"))?;
+        for (entry, run) in &decoded.runs {
+            if entry.count == 0 || records::decode_run(run, entry.count).is_err() {
+                return Err(refused("a run is malformed"));
+            }
+        }
+        let path = self.dir.join(segment_file_name(segment));
+        if self.owner.get(&segment).is_some_and(|owner| *owner != path) {
+            return Err(refused("the segment is compacted here"));
+        }
+        let total = bytes.len() as u64;
+        let Some(stop) = offset.checked_add(total) else {
+            return Err(refused("the offset overflows"));
+        };
+        if !self.replicas.contains_key(&segment) {
+            match self.fs.open(&path) {
+                Ok(file) => match file.size() {
+                    Ok(end) => {
+                        let file: Arc<dyn FsFile> = Arc::new(file);
+                        self.replicas.insert(segment, Replica { file, end });
+                    }
+                    Err(_) => return Err(self.fail()),
+                },
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(self.fail()),
+            }
+        }
+        let end = self
+            .replicas
+            .get(&segment)
+            .map_or(FILE_HEADER_LEN as u64, |r| r.end);
+        if let Some(replica) = self.replicas.get(&segment)
+            && stop <= end
+        {
+            let mut stored = vec![0; bytes.len()];
+            if replica.file.read_at(&mut stored, offset).is_err() {
+                return Err(self.fail());
+            }
+            return if stored == bytes {
+                Ok(())
+            } else {
+                Err(refused("a different block is at this offset"))
+            };
+        }
+        if offset != next_offset(end) {
+            return Err(refused("the offset is not the end of the replica"));
+        }
+        let created = !self.replicas.contains_key(&segment);
+        if created {
+            let header = FileHeader {
+                kind: FileKind::Segment,
+                epoch: header.epoch,
+            };
+            let file = match self.fs.create(&path) {
+                Ok(file) => file,
+                Err(_) => return Err(self.fail()),
+            };
+            if file.write_at(&header.encode(), 0).is_err() {
+                return Err(self.fail());
+            }
+            self.replicas.insert(
+                segment,
+                Replica {
+                    file: Arc::new(file),
+                    end,
+                },
+            );
+        }
+        let Some(replica) = self.replicas.get_mut(&segment) else {
+            return Err(Error::Stopped);
+        };
+        let file = Arc::clone(&replica.file);
+        replica.end = offset + total;
+        let landed = file
+            .write_at(&bytes, offset)
+            .and_then(|()| file.sync_data())
+            .and_then(|()| {
+                if created {
+                    self.fs.sync_dir(&self.dir)
+                } else {
+                    Ok(())
+                }
+            });
+        if landed.is_err() {
+            return Err(self.fail());
+        }
+        let mut fold = Fold::default();
+        fold.visit(&mut self.core, &path, &header, body);
+        if let Some(id) = fold.max_id {
+            self.last_id = self.last_id.max((id.ms(), u16::MAX));
+        }
+        for (key, kept) in fold.keys {
+            if self.keys.get(&key).is_none_or(|old| old.at < kept.at) {
+                self.keys.insert(key, kept);
+            }
+        }
+        let info = self.files.entry(path).or_insert(FileInfo {
+            len: 0,
+            bodies: 0,
+            carried: 0,
+            first_ms: header.commit_ms,
+            controls: false,
+            sealed: false,
+            segments: BTreeSet::from([segment]),
+        });
+        info.controls |= !fold.controls.is_empty();
+        info.len = offset + total;
+        info.bodies += body.len() as u64;
+        info.sealed = false;
+        self.owner
+            .entry(segment)
+            .or_insert_with(|| self.dir.join(segment_file_name(segment)));
+        let mut actions = Vec::new();
+        let mut streams = Vec::new();
+        for (_, start, run, record, commit_ms) in fold.runs {
+            self.index.add(segment, Arc::clone(&file));
+            streams.push(run.stream.clone());
+            self.index.insert(start, run);
+            actions.extend(self.core.apply(record, commit_ms));
+        }
+        if !streams.is_empty() {
+            self.applied.send_modify(|(n, changed)| {
+                *n += 1;
+                *changed = streams;
+            });
+        }
+        self.act(actions, None);
+        Ok(())
+    }
+
+    fn local_controls(&mut self, offset: u64, bytes: &[u8], reply: Reply<()>) {
+        if self.stopped {
+            reply.send(Err(Error::Stopped)).ok();
+            return;
+        }
+        let decoded = decode_bytes(bytes, offset)
+            .map_err(|_| refused("the block is damaged"))
+            .and_then(|(_, body)| {
+                records::decode(body).map_err(|_| refused("the body is malformed"))
+            });
+        match decoded {
+            Err(e) => {
+                reply.send(Err(e)).ok();
+            }
+            Ok(body) => {
+                let records: Vec<Record> = body
+                    .controls
+                    .into_iter()
+                    .filter_map(|c| match c {
+                        Control::Record(r) => Some(r),
+                        _ => None,
+                    })
+                    .collect();
+                if records.is_empty() {
+                    reply.send(Ok(())).ok();
+                    return;
+                }
+                self.pushing_local = true;
+                self.write(records, reply);
+                self.pushing_local = false;
+            }
+        }
+    }
+
+    fn fail(&mut self) -> Error {
+        self.stop();
+        Error::Stopped
+    }
+
     fn write(&mut self, records: Vec<Record>, reply: Reply<()>) {
-        let ticket = self.ticket(Box::new(move |result| {
+        let ticket = self.ticket(Box::new(move |result, _| {
             reply.send(result).ok();
         }));
         self.act(
@@ -1209,6 +1705,7 @@ impl<F: Fs + Clone> Engine<F> {
                 let published = Published {
                     first: kept.first,
                     count: kept.count,
+                    copies: 1,
                     repeat: true,
                 };
                 reply.send(Ok(published)).ok();
@@ -1260,10 +1757,11 @@ impl<F: Fs + Clone> Engine<F> {
         if let Some(key) = key {
             self.keys_in_flight.insert(key, Vec::new());
         }
-        let ticket = self.ticket(Box::new(move |result| {
+        let ticket = self.ticket(Box::new(move |result, copies| {
             let published = Published {
                 first,
                 count,
+                copies,
                 repeat: false,
             };
             reply.send(result.map(|()| published)).ok();
@@ -1273,7 +1771,7 @@ impl<F: Fs + Clone> Engine<F> {
     }
 
     fn take(&mut self, take: Take) -> Result<Taken, Error> {
-        let receipt = Receipt(u128::from_le_bytes(random(self.random.as_mut())?));
+        let receipt = Receipt::new(self.node, u64::from_le_bytes(random(self.random.as_mut())?));
         let request = TakeRequest {
             group: &take.group,
             selector: &take.selector,
@@ -1318,7 +1816,7 @@ impl<F: Fs + Clone> Engine<F> {
                 reply.send(Err(Error::Refused(refused))).ok();
             }
             Ok(actions) => {
-                let ticket = self.ticket(Box::new(move |result| {
+                let ticket = self.ticket(Box::new(move |result, _| {
                     reply.send(result).ok();
                 }));
                 self.act(actions, Some(ticket));
@@ -1597,9 +2095,11 @@ impl<F: Fs + Clone> Engine<F> {
         if !self
             .queue
             .back()
-            .is_some_and(|b| b.bytes + bytes <= BLOCK_CAP)
+            .is_some_and(|b| b.local == self.pushing_local && b.bytes + bytes <= BLOCK_CAP)
         {
-            self.queue.push_back(Pending::new());
+            let mut block = Pending::new();
+            block.local = self.pushing_local;
+            self.queue.push_back(block);
         }
         let Some(block) = self.queue.back_mut() else {
             return;
@@ -1621,10 +2121,21 @@ impl<F: Fs + Clone> Engine<F> {
             Ticket {
                 remaining: 1,
                 error: None,
+                copies: 0,
                 done,
             },
         );
         self.next_ticket
+    }
+
+    fn count_copies(&mut self, ticket: u64, copies: u32) {
+        if let Some(t) = self.tickets.get_mut(&ticket) {
+            t.copies = if t.copies == 0 {
+                copies
+            } else {
+                t.copies.min(copies)
+            };
+        }
     }
 
     fn hold_ticket(&mut self, ticket: u64) {
@@ -1645,7 +2156,7 @@ impl<F: Fs + Clone> Engine<F> {
             return;
         }
         if let Some(t) = self.tickets.remove(&ticket) {
-            (t.done)(t.error.map_or(Ok(()), Err));
+            (t.done)(t.error.map_or(Ok(()), Err), t.copies.max(1));
         }
     }
 
@@ -1688,7 +2199,7 @@ impl<F: Fs + Clone> Engine<F> {
         let (body, entries) = encoded;
         let commit_ms = self.clock.now_ms();
         let preallocate = if self.full { 0 } else { SEGMENT_BYTES };
-        let rx = log.append(commit_ms, body, preallocate);
+        let rx = log.append_as(commit_ms, body, preallocate, !block.local);
         self.flight = Some(Flight::Block(Box::new(Landing {
             rx,
             runs,
@@ -1698,6 +2209,7 @@ impl<F: Fs + Clone> Engine<F> {
             end: base + count,
             total,
             commit_ms,
+            local: block.local,
         })));
     }
 
@@ -1765,6 +2277,9 @@ impl<F: Fs + Clone> Engine<F> {
             match control {
                 Control::Record(record) => {
                     let settled = settled_key(&record);
+                    if let Record::Ack { group, .. } = &record {
+                        self.count_ack(group);
+                    }
                     if let Record::Generation { group, .. } = &record {
                         self.replayed(group);
                     }
@@ -1784,6 +2299,7 @@ impl<F: Fs + Clone> Engine<F> {
                         let published = Published {
                             first,
                             count,
+                            copies: 1,
                             repeat: true,
                         };
                         waiting.send(Ok(published)).ok();
@@ -1815,8 +2331,28 @@ impl<F: Fs + Clone> Engine<F> {
                 }
             }
         }
-        for ticket in landing.tickets {
-            self.release_ticket(ticket, Ok(()));
+        let key = (written.segment, written.offset);
+        if self.held && !landing.local {
+            match self.early.remove(&key) {
+                Some(copies) => {
+                    let result = if copies > 0 {
+                        Ok(())
+                    } else {
+                        Err(Error::Unconfirmed)
+                    };
+                    for ticket in landing.tickets {
+                        self.count_copies(ticket, copies);
+                        self.release_ticket(ticket, result.clone());
+                    }
+                }
+                None => {
+                    self.unconfirmed.insert(key, landing.tickets);
+                }
+            }
+        } else {
+            for ticket in landing.tickets {
+                self.release_ticket(ticket, Ok(()));
+            }
         }
         self.act(actions, None);
     }
@@ -1921,7 +2457,7 @@ impl<F: Fs + Clone> Engine<F> {
             }
         }
         for (_, ticket) in std::mem::take(&mut self.tickets) {
-            (ticket.done)(Err(Error::Stopped));
+            (ticket.done)(Err(Error::Stopped), 0);
         }
     }
 
@@ -2011,7 +2547,7 @@ impl<F: Fs + Clone> Engine<F> {
             self.last_sweep = now;
         }
         let aged = sweep.then(|| now.saturating_sub(SWEEP_MS));
-        let inputs = select(
+        let mut inputs = select(
             &self.files,
             &self.owner,
             self.full,
@@ -2019,6 +2555,10 @@ impl<F: Fs + Clone> Engine<F> {
             aged,
             |segment| (self.run_bytes(segment), self.kept(segment, now)),
         );
+        inputs.retain(|i| i.segments.is_disjoint(&self.open_foreign));
+        if let Some(stored) = &self.stored {
+            inputs.retain(|i| i.segments.is_subset(stored));
+        }
         let result = if inputs.is_empty() {
             Ok(())
         } else if self
@@ -2186,7 +2726,7 @@ impl<F: Fs + Clone> Engine<F> {
         ranges: Vec<(Vec<SegmentId>, std::ops::Range<u64>)>,
         reply: oneshot::Sender<bool>,
     ) {
-        let ticket = self.ticket(Box::new(move |result| {
+        let ticket = self.ticket(Box::new(move |result, _| {
             reply.send(result.is_ok()).ok();
         }));
         for (segments, range) in ranges {
@@ -2250,6 +2790,29 @@ impl<F: Fs + Clone> Engine<F> {
         }
     }
 
+    fn count_ack(&mut self, group: &str) {
+        let sec = self.clock.now_ms() / 1000;
+        let buckets = self.acked.entry(group.to_owned()).or_default();
+        match buckets.back_mut() {
+            Some((at, n)) if *at == sec => *n += 1,
+            _ => buckets.push_back((sec, 1)),
+        }
+        while buckets.front().is_some_and(|(at, _)| at + DRAIN_S <= sec) {
+            buckets.pop_front();
+        }
+    }
+
+    fn acks_in_window(&self, group: &str) -> u64 {
+        let sec = self.clock.now_ms() / 1000;
+        self.acked.get(group).map_or(0, |buckets| {
+            buckets
+                .iter()
+                .filter(|(at, _)| at + DRAIN_S > sec)
+                .map(|(_, n)| n)
+                .sum()
+        })
+    }
+
     fn holding(&self) -> Holding {
         let now = self.clock.now_ms();
         let mut order: Vec<(u64, SegmentId)> = self
@@ -2297,6 +2860,11 @@ impl<F: Fs + Clone> Engine<F> {
                     self.full = full;
                     self.core.set_pressure(full);
                 }
+            }
+            if self.lead_until.is_some_and(|until| now >= until) {
+                self.lead_until = None;
+                let actions = self.core.set_led(BTreeSet::new());
+                self.act(actions, None);
             }
             let actions = self.core.tick(now);
             self.act(actions, None);
@@ -2505,5 +3073,30 @@ mod tests {
         engine.pass();
         assert_eq!(answer.try_recv(), Ok(Err(Error::Stopped)));
         assert!(engine.stopped);
+    }
+
+    #[test]
+    fn forgetting_a_group_frees_its_ack_buckets() {
+        let scratch = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/tmp");
+        std::fs::create_dir_all(&scratch).expect("scratch dir");
+        let tmp = tempfile::TempDir::new_in(&scratch).expect("temp dir");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("runtime");
+        let (mut engine, _handle) = runtime
+            .block_on(Engine::open(
+                RealFs,
+                tmp.path(),
+                Arc::new(TestClock::new(1_000)),
+                Box::new(OsRandom),
+            ))
+            .expect("open");
+        engine.count_ack("g");
+        let (reply, _answer) = oneshot::channel();
+        engine.command(Command::Forget {
+            group: "g".to_owned(),
+            reply,
+        });
+        assert!(engine.acked.is_empty(), "the ack buckets stay");
     }
 }

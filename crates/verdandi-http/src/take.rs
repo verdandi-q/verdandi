@@ -1,5 +1,6 @@
 use std::collections::BTreeMap;
 use std::fmt::Display;
+use std::sync::Arc;
 use std::time::{Duration, UNIX_EPOCH};
 
 use axum::Json;
@@ -23,7 +24,8 @@ use verdandi_store::records::Message;
 use crate::error::{ErrorBody, Fail, NAMES, STOPPED};
 use crate::publish::{essence, json_type};
 use crate::reads;
-use crate::{Node, ready};
+use crate::route::Route;
+use crate::{Cluster, Node, ready};
 
 pub(crate) const LEASE_MAX_S: u64 = 43_200;
 pub(crate) const LIMIT: usize = 100;
@@ -126,17 +128,19 @@ enum Value<'a> {
 pub async fn take(
     State(node): State<Node>,
     Extension(mut stopping): Extension<watch::Receiver<bool>>,
+    cluster: Option<Extension<Arc<Cluster>>>,
     method: Method,
     headers: HeaderMap,
     path: Result<Path<String>, PathRejection>,
     query: Result<Query<Options>, QueryRejection>,
 ) -> Result<Response, Fail> {
     let handle = ready(&node)?;
+    let route = Route::of(cluster, &headers)?;
     let Path(stream) = path.map_err(|e| Fail::bad(e.body_text(), "check the stream name"))?;
     let Query(mut options) =
         query.map_err(|e| Fail::bad(e.body_text(), "check the query parameters"))?;
     let Some(group) = options.group.take() else {
-        return reads::read(handle, stopping, &headers, stream, options).await;
+        return reads::read(handle, stopping, &headers, stream, options, route.as_ref()).await;
     };
     if options.from.is_some() || options.follow.is_some() {
         return Err(Fail::bad(
@@ -171,6 +175,7 @@ pub async fn take(
         lease_ms: lease * 1000,
         wait: wait > 0,
     };
+    let mut asked = false;
     loop {
         match handle.take(take.clone()).await? {
             Taken::Leased {
@@ -194,8 +199,15 @@ pub async fn take(
                 unreplied.ids.clear();
                 return Ok(reply.unwrap_or_else(|| empty(&take, max_bytes)));
             }
-            Taken::Empty => return Ok(empty(&take, max_bytes)),
+            Taken::Empty => {
+                let elsewhere = elsewhere(route.as_ref(), &mut asked, &take, max_bytes).await;
+                return Ok(elsewhere.unwrap_or_else(|| empty(&take, max_bytes)));
+            }
             Taken::Waiting { waiter, woken } => {
+                if let Some(reply) = elsewhere(route.as_ref(), &mut asked, &take, max_bytes).await {
+                    handle.cancel(waiter).await?;
+                    return Ok(reply);
+                }
                 tokio::select! {
                     woken = tokio::time::timeout_at(deadline, woken) => match woken {
                         Ok(Ok(())) => {}
@@ -213,6 +225,26 @@ pub async fn take(
             }
         }
     }
+}
+
+async fn elsewhere(
+    route: Option<&Route>,
+    asked: &mut bool,
+    take: &Take,
+    max_bytes: usize,
+) -> Option<Response> {
+    let route = route.filter(|route| !route.hop)?;
+    if std::mem::replace(asked, true) {
+        return None;
+    }
+    let path = format!(
+        "/s/{}?group={}&limit={}&lease={}&max_bytes={max_bytes}",
+        take.selector,
+        take.group,
+        take.limit,
+        take.lease_ms / 1000
+    );
+    route.take(&path).await
 }
 
 struct Unreplied {

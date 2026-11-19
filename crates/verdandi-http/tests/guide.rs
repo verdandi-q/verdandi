@@ -194,7 +194,7 @@ async fn root_json_gives_node_copies_streams_groups_warnings_and_links() {
     assert!(body["node"]["write_bytes_per_s"].is_u64(), "{body}");
     assert_eq!(
         body["copies"],
-        json!({"ack_count": 1, "target": 1, "why": "one node"})
+        json!({"ack_count": 1, "target": 1, "floor": 1, "why": "one node"})
     );
     assert_eq!(body["streams"], json!(["orders"]));
     assert_eq!(
@@ -705,6 +705,7 @@ async fn guide_walk_publishes_takes_extends_and_acks_using_only_the_guide_text()
     };
     let (status, published, _) = run(&curl(&first("PUBLISH"))).await;
     assert_eq!(status, StatusCode::CREATED, "{published}");
+    assert_eq!(published["copies"], 1);
     let id = published["ids"][0].as_str().expect("an id").to_owned();
     let (status, taken, _) = run(&curl(&first("TAKE"))).await;
     assert_eq!(status, StatusCode::OK, "{taken}");

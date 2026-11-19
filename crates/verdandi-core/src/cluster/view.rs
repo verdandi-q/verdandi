@@ -77,7 +77,7 @@ pub struct Entry {
     pub body: Body,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Line {
     pub disk: u64,
     pub head: Head,
@@ -625,12 +625,7 @@ impl View {
                 if new {
                     m.absent_run_ms = Some(run_ms);
                 }
-                if new
-                    && head.state == State::Dead
-                    && m.entry.body.holds > 0
-                    && !m.heard
-                    && !drained
-                {
+                if new && head.state == State::Dead && !m.heard && !drained {
                     let loss = self
                         .losses
                         .entry((disk, head.restart))
@@ -1041,6 +1036,15 @@ mod tests {
         }
         assert!(!view.absent(2));
         assert!(view.absent(3));
+        assert_eq!(view.losses(0), 1);
+    }
+
+    #[test]
+    fn a_member_that_holds_no_data_and_dies_is_a_loss() {
+        let mut view = View::new(1, 1, body(1), 0, 0);
+        view.merge(&[update(2, 1, 1, State::Alive, body(0))], 0, 0);
+        view.tick(FAIL_MS + 1, FAIL_MS + 1, &[]);
+        assert!(view.absent(2));
         assert_eq!(view.losses(0), 1);
     }
 
