@@ -662,6 +662,50 @@ fn a_copy_that_no_holder_set_names_does_not_count() {
 }
 
 #[test]
+fn a_copy_that_no_holder_set_names_does_not_count_when_its_node_dies_first() {
+    for seed in 0..10 {
+        let mut w = World::new(seed);
+        w.headroom = 0.1;
+        w.start(6, 3, OLD);
+        warm(&mut w);
+        let group = w.groups().expect("groups").groups[0].clone();
+        let x = w
+            .running()
+            .into_iter()
+            .find(|d| !group.contains(d))
+            .expect("a node outside the group");
+        let before = floors(&w).into_iter().max().expect("a floor");
+        let mut holders = group.clone();
+        holders.push(x);
+        let id = w.place(&holders, SEGMENT_BYTES);
+        w.advance(1_000);
+        w.kill(x);
+        for _ in 0..24 {
+            if !w.segments[&id].holders.holders.contains(&x)
+                && floors(&w).into_iter().max().expect("a floor") > before
+            {
+                break;
+            }
+            w.advance(5_000);
+        }
+        assert!(!w.segments[&id].holders.holders.contains(&x), "seed {seed}");
+        eprintln!(
+            "DBG {seed} losses {} floors {:?}",
+            w.losses.len(),
+            floors(&w)
+        );
+        assert!(
+            floors(&w).into_iter().max().expect("a floor") > before,
+            "seed {seed}: floor did not rise after the loss: {:?}",
+            floors(&w)
+        );
+        assert!(w.boot(x, 1));
+        assert!(w.settle_repair(SETTLE_MS), "seed {seed}");
+        assert_eq!(w.lost(), 0, "seed {seed}");
+    }
+}
+
+#[test]
 #[should_panic(expected = "no live named holder")]
 fn the_repair_check_refuses_a_live_copy_that_no_holder_set_names() {
     let mut w = World::new(0);
@@ -3277,4 +3321,26 @@ fn raft_election_time_after_a_leader_kill() {
         at(99),
         times[times.len() - 1]
     );
+}
+
+#[test]
+fn scratch_cuts_seed() {
+    let first = setting("SCR_FIRST", 0);
+    let count = setting("SCR_COUNT", 1);
+    let kind = setting("SCR_KIND", 0);
+    let (loss, restarts, bound) = if kind == 0 {
+        (0.2, 0.0, CUTS_LOSS_BOUND_MS)
+    } else {
+        (0.0, 0.3, CUTS_RESTARTS_BOUND_MS)
+    };
+    let bad: Vec<u64> = (first..first + count)
+        .filter(|s| {
+            std::panic::catch_unwind(|| {
+                cut_run(*s, loss, restarts, bound);
+            })
+            .is_err()
+        })
+        .collect();
+    println!("SCRATCH kind={kind} first={first} count={count} bad={bad:?}");
+    assert!(bad.is_empty());
 }

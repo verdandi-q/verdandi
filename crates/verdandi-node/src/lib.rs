@@ -1461,6 +1461,9 @@ impl Node {
                 if self.raft.leader() == Some(from) {
                     self.heard_ms = Some(now);
                 }
+                if self.raft.is_leader() {
+                    self.govern(out);
+                }
                 self.flush(out);
             }
             Msg::Lose(disk) => {
@@ -3016,7 +3019,8 @@ impl Node {
             !view.absent(*l)
                 && !stop
                 && !drained
-                && view.entry(*l).is_some_and(|e| e.body.epoch == meta.shape)
+                && self.raft.caught_up(*l)
+                && view.entry(*l).is_some_and(|e| e.body.epoch > 0)
         });
         let add = view.live().map(|(d, _)| d).find(|d| {
             let (stop, drained, _) = flags(*d);

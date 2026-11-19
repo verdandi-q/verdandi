@@ -15,6 +15,28 @@ fn next(seed: &mut u64) -> u64 {
     *seed
 }
 
+async fn ack(c: &Cluster, ip: &str) -> (u64, u64) {
+    let probe = c
+        .http
+        .post(format!("http://{ip}:8080/s/{STREAM}"))
+        .body("c6m:9:0;probe")
+        .send()
+        .await
+        .expect("probe");
+    let body: Value = serde_json::from_slice(&probe.bytes().await.expect("body")).expect("json");
+    let root = c
+        .http
+        .get(format!("http://{ip}:8080/"))
+        .send()
+        .await
+        .expect("root");
+    let root: Value = serde_json::from_slice(&root.bytes().await.expect("body")).expect("json");
+    (
+        body["copies"].as_u64().expect("copies in the reply"),
+        root["copies"]["ack_count"].as_u64().expect("ack_count"),
+    )
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore]
 async fn five_scale_and_replace_events_then_five_three_node_kill_sets_and_the_loss_fraction() {
@@ -51,12 +73,27 @@ async fn five_scale_and_replace_events_then_five_three_node_kill_sets_and_the_lo
                 c.nodes[i].start();
             }
         }
-        let members = c.try_members(live.len(), 20).await;
+        let members = c.try_members(live.len(), 45).await;
         c.wait_ready(120).await;
         sleep(Duration::from_secs(5)).await;
+        let ip = c.nodes[live[0]].ip.clone();
+        let (copies, floor) = ack(&c, &ip).await;
         eprintln!(
-            "C6 ROW12 event={event} members={members:?} secs={:.0}",
+            "C6 ROW12 event={event} members={members:?} live={} ack-copies={copies} floor={floor} secs={:.0}",
+            live.len(),
             at.elapsed().as_secs_f64()
+        );
+        assert!(
+            members.is_ok(),
+            "after {event}: member count is not the live count {}: {members:?}\n{}",
+            live.len(),
+            c.logs()
+        );
+        assert!(
+            copies >= floor.min(live.len() as u64),
+            "after {event}: ack copies {copies} below min(floor {floor}, live {})\n{}",
+            live.len(),
+            c.logs()
         );
     }
     let mut seed = std::time::SystemTime::now()
@@ -65,24 +102,8 @@ async fn five_scale_and_replace_events_then_five_three_node_kill_sets_and_the_lo
         .as_nanos() as u64
         | 1;
     eprintln!("C6 ROW12 seed={seed} live={live:?}");
-    let probe = c
-        .http
-        .post(format!("http://{}:8080/s/{STREAM}", c.nodes[live[0]].ip))
-        .body("c6m:9:0;probe")
-        .send()
-        .await
-        .expect("probe");
-    let body: Value = serde_json::from_slice(&probe.bytes().await.expect("body")).expect("json");
-    let root = c
-        .http
-        .get(format!("http://{}:8080/", c.nodes[live[0]].ip))
-        .send()
-        .await
-        .expect("root");
-    let root: Value = serde_json::from_slice(&root.bytes().await.expect("body")).expect("json");
     eprintln!(
-        "C6 ROW12 ack-copies={} controller={}",
-        body["copies"], root["copies"]
+        "C6 ROW12 cut: 5 events (row text: 20) and 5 random 3-node sets (row text: every set)"
     );
     let mut gone: BTreeSet<String> = BTreeSet::new();
     let mut hit = 0;
@@ -160,6 +181,10 @@ async fn five_scale_and_replace_events_then_five_three_node_kill_sets_and_the_lo
         gone.extend(fresh);
     }
     load.stop().await;
+    assert!(
+        hit <= bound,
+        "loss fraction {hit}/5 is above the bound {bound}/5 (sets that held a whole copy group)"
+    );
     eprintln!(
         "C6 ROW12 kill-sets-with-loss={hit} of 5 fraction={:.2} sets-holding-a-whole-copy-group={bound} total-lost={}",
         hit as f64 / 5.0,

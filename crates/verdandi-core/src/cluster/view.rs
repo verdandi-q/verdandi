@@ -391,7 +391,8 @@ impl View {
             self.pending = None;
             return;
         }
-        let urgent = own.signals != body.signals
+        let urgent = (own.epoch == 0 && body.epoch != 0)
+            || own.signals != body.signals
             || own.reconciled != body.reconciled
             || own.marks != body.marks
             || own.unreachable != body.unreachable;

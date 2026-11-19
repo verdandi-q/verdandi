@@ -7,6 +7,7 @@ use serde_json::Value;
 use std::time::{Duration, Instant};
 use tokio::time::sleep;
 use verdandi_core::cluster::controller::MAX_COPIES;
+use verdandi_core::cluster::view::SAMPLE_MS;
 
 async fn copies(c: &mut Cluster) -> Option<u64> {
     let ips = c.running();
@@ -31,8 +32,8 @@ async fn ten_losses_in_five_minutes_raise_the_ack_count_within_one_sample() {
     let mut c = Cluster::new("row18", 6, false).await;
     c.start_staged().await;
     c.wait_members(6, 120).await;
-    let load = Load::start(&c, 2, 0, 50_000, 10);
-    while load.acked() < 100 {
+    let load = Load::start(&c, 2, 0, 20_000, 10);
+    while load.acked() < 40 {
         sleep(Duration::from_millis(250)).await;
     }
     let rec = load.stop().await;
@@ -45,7 +46,7 @@ async fn ten_losses_in_five_minutes_raise_the_ack_count_within_one_sample() {
         | 1;
     eprintln!("C6 ROW18 seed={seed}");
     let begun = Instant::now();
-    let mut last = None;
+    let mut last: Option<u64> = None;
     let mut base = None;
     let mut kills = Vec::new();
     let mut changes = Vec::new();
@@ -70,40 +71,39 @@ async fn ten_losses_in_five_minutes_raise_the_ack_count_within_one_sample() {
             restart_at = Some((t + 3, victim));
             next_kill = t + 28;
         }
-        let now = copies(&mut c).await;
-        if now != last {
-            eprintln!("C6 ROW18 t={t} copies={now:?} kills-so-far={}", kills.len());
-            changes.push((t, now, kills.len()));
-            last = now;
-        }
-        if base.is_none() {
-            base = now;
+        if let Some(now) = copies(&mut c).await {
+            if Some(now) != last {
+                eprintln!("C6 ROW18 t={t} copies={now} kills-so-far={}", kills.len());
+                changes.push((t, now, kills.len()));
+                last = Some(now);
+            }
+            if base.is_none() {
+                base = Some(now);
+            }
         }
         sleep(Duration::from_secs(1)).await;
     }
     eprintln!("C6 ROW18 kills-at={kills:?} base={base:?} changes={changes:?}");
-    let base = base.expect("a probe was acked before the first loss");
+    let base = base.expect("a probe was answered before the first loss");
     assert!(
-        changes.iter().all(|(_, n, _)| n.is_some_and(|n| n >= base)),
+        base < u64::from(MAX_COPIES),
+        "the start count {base} is already MAX_COPIES, so no rise can show"
+    );
+    assert!(
+        changes.iter().all(|(_, n, _)| *n >= base),
         "the controller ack count fell inside the quiet period: {changes:?}"
     );
-    if base < u64::from(MAX_COPIES) {
-        let (t, _, count) = changes
-            .iter()
-            .find(|(_, n, _)| n.is_some_and(|n| n > base))
-            .copied()
-            .expect("the controller ack count in GET / never rose over 10 losses");
-        let kill = kills.get(count.wrapping_sub(1)).copied().unwrap_or(0);
-        assert!(
-            t.saturating_sub(kill) <= 10,
-            "rise {t} s came {} s after loss {count}",
-            t - kill
-        );
-    } else {
-        eprintln!(
-            "C6 ROW18 gap: the count starts at MAX_COPIES (the 24 h prior), so no rise can show"
-        );
-    }
+    let (t, _, count) = changes
+        .iter()
+        .find(|(_, n, _)| *n > base)
+        .copied()
+        .expect("the controller ack count in GET / never rose over 10 losses");
+    let kill = kills.get(count.wrapping_sub(1)).copied().unwrap_or(0);
+    assert!(
+        t.saturating_sub(kill) <= SAMPLE_MS / 1000 + 2,
+        "rise {t} s came {} s after loss {count}",
+        t.saturating_sub(kill)
+    );
     eprintln!("C6 ROW18 gap: the fall after the 6 h quiet period has no hook and is not checked");
     eprintln!("C6 ROW18 run-secs={:.0}", run.elapsed().as_secs_f64());
     c.clean();

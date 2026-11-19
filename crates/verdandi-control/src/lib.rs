@@ -636,10 +636,6 @@ impl Control {
         &self.conf.learners
     }
 
-    pub fn campaign(&mut self) -> raft::Result<()> {
-        self.node.campaign()
-    }
-
     pub fn caught_up(&self, id: u64) -> bool {
         self.is_leader()
             && self

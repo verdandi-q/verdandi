@@ -52,7 +52,7 @@ const HELLO_TIMEOUT: Duration = Duration::from_secs(5);
 const KNOWN_FOR: Duration = Duration::from_secs(25);
 const FOUND_ROUNDS: u32 = 2;
 const FIND_MS: u64 = 1_000;
-const QUIET: Duration = Duration::from_secs(5);
+const QUIET: Duration = Duration::from_secs(3);
 const SPLIT_LOG: Duration = Duration::from_secs(60);
 const COPY_WAIT: Duration = Duration::from_secs(3);
 const COPY_TRIES: u32 = 5;
@@ -2018,8 +2018,7 @@ impl Driver {
     }
 
     fn found(&mut self) -> Result<()> {
-        let mut raft = Control::found(self.me).map_err(Error::other)?;
-        raft.campaign().map_err(Error::other)?;
+        let raft = Control::found(self.me).map_err(Error::other)?;
         let saved = raft.save().map_err(Error::other)?;
         put(&self.part("control"), &SavedFile::new(&saved)?)?;
         self.node.raft = raft;
